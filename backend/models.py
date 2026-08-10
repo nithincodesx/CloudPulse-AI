@@ -14,7 +14,8 @@ from pydantic import BaseModel, Field
 # ---------------------------------------------------------------------------
 
 class MetricPayload(BaseModel):
-    server_id: str
+    # NOTE: server_id is intentionally absent — the target server is
+    # identified server-side by the ingestion token (Authorization: Bearer).
     cpu_usage: float = Field(..., ge=0.0, le=100.0)
     ram_usage: float = Field(..., ge=0.0, le=100.0)
     network_traffic: float = Field(..., ge=0.0)

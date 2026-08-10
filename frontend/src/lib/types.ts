@@ -2,6 +2,7 @@ export interface Server {
   id: string;
   server_name: string;
   ip_address?: string;
+  ingestion_token?: string;
   status: "active" | "warning" | "critical" | "idle";
   specifications?: {
     vcpus?: number;

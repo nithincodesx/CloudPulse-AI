@@ -4,14 +4,19 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone
+from typing import Optional
 from uuid import uuid4
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
 from database import (
     get_server,
+    get_server_by_token,
     init_db,
     insert_alert,
     insert_metric,
@@ -47,13 +52,26 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# CORS — only allow explicit frontend origins (comma-separated env var).
+CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000")
+allowed_origins = [o.strip() for o in CORS_ORIGINS.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Narrow in production
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ---------------------------------------------------------------------------
+# Rate limiting (slowapi; in-memory store, per-process)
+# ---------------------------------------------------------------------------
+RATE_LIMIT_PER_MINUTE = os.getenv("RATE_LIMIT_PER_MINUTE", "30")
+
+limiter = Limiter(key_func=get_remote_address, default_limits=[])
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # ---------------------------------------------------------------------------
 # Thresholds (tunable via env vars in production)
@@ -146,22 +164,32 @@ def health_check():
     return {"status": "ok"}
 
 
-@app.post("/api/metrics", response_model=MetricResponse)
-def ingest_metrics(payload: MetricPayload):
-    """Accept a telemetry payload, store it, and run anomaly detection."""
-    server = get_server(payload.server_id)
-    if not server:
-        # Auto-register unknown servers instead of failing 404
-        from database import upsert_server
-        upsert_server({
-            "id": payload.server_id,
-            "server_name": f"host-{payload.server_id[:8]}",
-            "status": "active",
-        })
+def _bearer_token(request: Request) -> Optional[str]:
+    """Extract the bearer token from the Authorization header (None if absent)."""
+    authorization = request.headers.get("authorization", "")
+    if not authorization.lower().startswith("bearer "):
+        return None
+    token = authorization.split(" ", 1)[1].strip()
+    return token or None
 
+
+@app.post("/api/metrics", response_model=MetricResponse)
+@limiter.limit(f"{RATE_LIMIT_PER_MINUTE}/minute")
+def ingest_metrics(request: Request, payload: MetricPayload):
+    """Accept a telemetry payload, store it, and run anomaly detection.
+
+    Auth: the caller presents a per-server ingestion token as
+    ``Authorization: Bearer <token>``. Unknown or missing tokens are rejected —
+    servers are no longer auto-registered.
+    """
+    server = get_server_by_token(_bearer_token(request))
+    if not server:
+        raise HTTPException(status_code=401, detail="Invalid or missing ingestion token")
+
+    server_id = server["id"]
     row = insert_metric(
         {
-            "server_id": payload.server_id,
+            "server_id": server_id,
             "cpu_usage": payload.cpu_usage,
             "ram_usage": payload.ram_usage,
             "network_traffic": payload.network_traffic,
@@ -171,7 +199,7 @@ def ingest_metrics(payload: MetricPayload):
     )
 
     alert_triggered = _check_thresholds(
-        payload.server_id,
+        server_id,
         payload.cpu_usage,
         payload.ram_usage,
         payload.estimated_cost_per_hour,
@@ -180,7 +208,7 @@ def ingest_metrics(payload: MetricPayload):
 
     return MetricResponse(
         id=row.get("id", uuid4()),
-        server_id=row.get("server_id", payload.server_id),
+        server_id=row.get("server_id", server_id),
         cpu_usage=row.get("cpu_usage", payload.cpu_usage),
         ram_usage=row.get("ram_usage", payload.ram_usage),
         network_traffic=row.get("network_traffic", payload.network_traffic),

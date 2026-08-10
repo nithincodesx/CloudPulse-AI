@@ -1,24 +1,26 @@
+import { createBrowserClient } from "@supabase/ssr";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import type { DashboardData, Alert } from "./types";
 
-/** Lazily-created Supabase client — avoids crashing on build when env vars missing. */
-let _supabase: SupabaseClient | null = null;
+// Browser Supabase client — powers auth (login/magic link) and owns-server
+// provisioning. Env vars are injected at build time via NEXT_PUBLIC_*.
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 
-export function getSupabase(): SupabaseClient | null {
-  if (_supabase) return _supabase;
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
-  if (!url || !key) return null;
-  // Dynamic import to avoid build failure when env vars are missing
-  const { createClient } = require("@supabase/supabase-js");
-  _supabase = createClient(url, key);
-  return _supabase;
+if (!supabaseUrl || !supabaseAnonKey) {
+  throw new Error(
+    "NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY must be set in " +
+      "frontend/.env.local (copy frontend/.env.local.example)."
+  );
 }
 
+export const supabase: SupabaseClient = createBrowserClient(supabaseUrl, supabaseAnonKey);
+
 // ---------------------------------------------------------------------------
-// API Calls (Real Backend Integration)
+// Backend API calls (real backend integration). The dashboard reads through
+// the FastAPI backend; the Supabase client is used for auth + provisioning.
 // ---------------------------------------------------------------------------
-const API_URL = "http://localhost:8000";
+const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
 export async function fetchDashboardData(): Promise<DashboardData> {
   const res = await fetch(`${API_URL}/api/servers/status`);
@@ -58,8 +60,7 @@ export async function updateServerStatus(serverId: string, status: string): Prom
   }
 }
 
-// Subscriptions are no longer used since we rely on SQLite and polling
+// Subscriptions are no longer used since we rely on the backend and polling.
 export function subscribeToAlerts(callback: (payload: any) => void) {
   return null;
 }
-

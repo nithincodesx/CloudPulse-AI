@@ -1,9 +1,10 @@
 "use client";
 
 import React from "react";
-import { Menu, RefreshCw, Bell } from "lucide-react";
+import { Menu, RefreshCw, Bell, LogOut } from "lucide-react";
 import { useDashboard } from "@/lib/DashboardContext";
-import { usePathname } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
+import { useAuth } from "@/lib/AuthContext";
 
 interface TopbarProps {
   setSidebarOpen: (val: boolean) => void;
@@ -17,8 +18,15 @@ function cn(...classes: (string | boolean | undefined)[]) {
 
 export default function Topbar({ setSidebarOpen }: TopbarProps) {
   const { data, loading, isLive, setIsLive, alertFeedOpen, setAlertFeedOpen, loadData } = useDashboard();
+  const { user, signOut } = useAuth();
+  const router = useRouter();
   const pathname = usePathname();
   const summary = data?.summary;
+
+  const handleSignOut = async () => {
+    await signOut();
+    router.replace("/login");
+  };
 
   let title = "Dashboard";
   if (pathname === "/servers") {
@@ -102,6 +110,25 @@ export default function Topbar({ setSidebarOpen }: TopbarProps) {
                 {summary?.active_alerts_count ?? 605}
               </span>
             </button>
+
+            {/* Signed-in user + logout */}
+            {user && (
+              <div className="hidden sm:flex items-center gap-2 pl-1 border-l border-white/10 ml-1">
+                <span
+                  className="max-w-[140px] truncate text-[11px] font-medium text-paper/60"
+                  title={user.email ?? ""}
+                >
+                  {user.email}
+                </span>
+                <button
+                  onClick={handleSignOut}
+                  className="flex h-8 items-center gap-1.5 rounded-full border border-white/10 bg-transparent px-2.5 text-[11px] font-medium text-paper/70 hover:bg-white/5 hover:text-white transition-all cursor-pointer"
+                  title="Sign out"
+                >
+                  <LogOut size={13} />
+                </button>
+              </div>
+            )}
           </div>
         </div>
     </header>

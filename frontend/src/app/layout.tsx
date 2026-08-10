@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import { AuthProvider } from "@/lib/AuthContext";
 
 export const metadata: Metadata = {
   title: "CloudPulse AI — Enterprise Cost & Resource Monitor",
@@ -23,7 +24,7 @@ export default function RootLayout({
       <body className="min-h-screen selection:bg-accent-yellow/30 selection:text-ink">
         {/* Grain overlay */}
         <div className="grain" />
-        {children}
+        <AuthProvider>{children}</AuthProvider>
       </body>
     </html>
   );

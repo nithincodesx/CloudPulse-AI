@@ -5,14 +5,13 @@ Captures real-time host metrics via psutil and pushes them to the
 FastAPI backend at a configurable interval.
 
 Usage:
-    python telemetry_agent.py --server-id <uuid> [--interval 5] [--api-url http://localhost:8000]
+    python telemetry_agent.py --token <INGESTION_TOKEN> [--interval 5] [--api-url http://localhost:8000]
 """
 
 from __future__ import annotations
 
 import argparse
 import time
-import uuid as uuid_mod
 from typing import NoReturn
 
 import psutil
@@ -45,20 +44,22 @@ def collect_metrics() -> dict:
 # Main loop
 # ---------------------------------------------------------------------------
 
-def run_agent(server_id: str, api_url: str, interval: int) -> NoReturn:
-    """Continuously collect and push metrics."""
-    print(f"[CloudPulse Agent] Server ID: {server_id}")
+def run_agent(token: str, api_url: str, interval: int) -> NoReturn:
+    """Continuously collect and push metrics, authenticating with a bearer token."""
+    print(f"[CloudPulse Agent] Token:      {token[:12]}… (server identified by token)")
     print(f"[CloudPulse Agent] API:        {api_url}/api/metrics")
     print(f"[CloudPulse Agent] Interval:   {interval}s")
     print("-" * 56)
 
-    with httpx.Client(base_url=api_url, timeout=10) as client:
+    headers = {"Authorization": f"Bearer {token}"}
+
+    with httpx.Client(base_url=api_url, timeout=10, headers=headers) as client:
         while True:
             try:
                 metrics = collect_metrics()
-                metrics["server_id"] = server_id
 
                 resp = client.post("/api/metrics", json=metrics)
+                resp.raise_for_status()
                 data = resp.json()
 
                 alert_flag = "[ALERT]" if data.get("alert_triggered") else ""
@@ -73,6 +74,8 @@ def run_agent(server_id: str, api_url: str, interval: int) -> NoReturn:
 
             except httpx.ConnectError:
                 print(f"[{time.strftime('%H:%M:%S')}] [ERROR] Cannot reach {api_url}")
+            except httpx.HTTPStatusError as exc:
+                print(f"[{time.strftime('%H:%M:%S')}] [ERROR] {exc.response.status_code}: {exc.response.text}")
             except Exception as exc:
                 print(f"[{time.strftime('%H:%M:%S')}] [ERROR] {exc}")
 
@@ -83,21 +86,12 @@ def run_agent(server_id: str, api_url: str, interval: int) -> NoReturn:
 # CLI
 # ---------------------------------------------------------------------------
 
-def _valid_uuid(s: str) -> str:
-    try:
-        uuid_mod.UUID(s)
-    except ValueError:
-        raise argparse.ArgumentTypeError(f"'{s}' is not a valid UUID")
-    return s
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="CloudPulse AI Telemetry Agent")
     parser.add_argument(
-        "--server-id",
+        "--token",
         required=True,
-        type=_valid_uuid,
-        help="UUID of the server node in Supabase",
+        help="Ingestion token of the server node (from the CloudPulse UI or the servers table)",
     )
     parser.add_argument(
         "--interval",
@@ -113,6 +107,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     try:
-        run_agent(args.server_id, args.api_url, args.interval)
+        run_agent(args.token, args.api_url, args.interval)
     except KeyboardInterrupt:
         print("\n[CloudPulse Agent] Shutting down.")

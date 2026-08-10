@@ -3,6 +3,10 @@
 The schema lives in ``supabase-schema.sql`` and is applied once in the
 Supabase SQL Editor. This module talks to it over PostgREST via the
 supabase-py client — there is no local database and no SQLite.
+
+The backend uses the **service-role key**, which bypasses Row Level
+Security; RLS (`auth.uid() = owner_id`) protects the tables from direct
+anon-key access by the frontend. The service key never leaves the backend.
 """
 
 import os
@@ -16,20 +20,20 @@ from supabase import Client, create_client
 load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 
-if not SUPABASE_URL or not SUPABASE_KEY:
+if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
     raise RuntimeError(
-        "SUPABASE_URL and SUPABASE_KEY must be set. Copy backend/.env.example "
+        "SUPABASE_URL and SUPABASE_SERVICE_KEY must be set. Copy backend/.env.example "
         "to backend/.env and fill them in, then apply supabase-schema.sql in "
         "the Supabase SQL Editor."
     )
 
 try:
-    _supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    _supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 except Exception as exc:
     raise RuntimeError(
-        "Could not initialize the Supabase client from SUPABASE_URL/SUPABASE_KEY. "
+        "Could not initialize the Supabase client from SUPABASE_URL/SUPABASE_SERVICE_KEY. "
         "Verify the credentials in backend/.env (see backend/.env.example). "
         f"({exc})"
     ) from exc
@@ -46,7 +50,7 @@ def init_db():
         print("[CloudPulse] Supabase connected — schema OK.")
     except Exception as exc:
         raise RuntimeError(
-            "Could not reach Supabase. Check SUPABASE_URL/SUPABASE_KEY and "
+            "Could not reach Supabase. Check SUPABASE_URL/SUPABASE_SERVICE_KEY and "
             "that supabase-schema.sql has been applied in the SQL Editor. "
             f"({exc})"
         ) from exc
@@ -76,29 +80,16 @@ def get_server(server_id: str) -> Optional[dict]:
     )
 
 
-def upsert_server(payload: dict) -> dict:
-    """Register or update a server node."""
-    if "id" not in payload:
-        payload["id"] = str(uuid.uuid4())
-    if "created_at" not in payload:
-        payload["created_at"] = datetime.now(timezone.utc).isoformat()
-    if "status" not in payload:
-        payload["status"] = "active"
-
-    fields = {
-        "server_name": payload.get("server_name", "Unknown Node"),
-        "ip_address": payload.get("ip_address"),
-        "status": payload["status"],
-        "specifications": payload.get("specifications"),
-    }
-
-    if get_server(payload["id"]) is not None:
-        _supabase.table("servers").update(fields).eq("id", payload["id"]).execute()
-    else:
-        _supabase.table("servers").insert(
-            {**fields, "id": payload["id"], "created_at": payload["created_at"]}
-        ).execute()
-    return get_server(payload["id"])
+def get_server_by_token(token: str) -> Optional[dict]:
+    """Return the server that owns the given ingestion token (None when unknown)."""
+    return (
+        _supabase.table("servers")
+        .select("*")
+        .eq("ingestion_token", token)
+        .maybe_single()
+        .execute()
+        .data
+    )
 
 
 def update_server_status(server_id: str, status: str) -> dict:
