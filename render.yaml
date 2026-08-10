@@ -1,0 +1,45 @@
+# Render Blueprint — CloudPulse AI backend (free tier).
+#
+# "New → Blueprint" in Render, pick this repo, and Render builds the Dockerfile
+# and provisions the service. Secrets below are placeholders (sync: false) —
+# set their real values in the Render dashboard (Service → Environment) after
+# creation. The free tier sleeps after ~15 min idle; /health doubles as the
+# wake/health check that Render pings.
+services:
+  - type: web
+    name: cloudpulse-api
+    runtime: docker
+    repo: https://github.com/nithincodesx/CloudPulse-AI
+    branch: main
+    plan: free
+    autoDeploy: true
+    dockerfilePath: backend/Dockerfile
+    dockerContext: ./backend
+    healthCheckPath: /health
+    envVars:
+      # --- Required: Supabase (free tier) ---
+      - key: SUPABASE_URL
+        sync: false # set in dashboard
+      - key: SUPABASE_SERVICE_KEY
+        sync: false # set in dashboard — NEVER commit this
+      # --- Browser origins allowed by CORS (the deployed Vercel app) ---
+      - key: CORS_ORIGINS
+        value: https://cloudpulse-ai.vercel.app
+      - key: RATE_LIMIT_PER_MINUTE
+        value: "30"
+      # --- Optional: AWS Cost Explorer (leave empty for simulated mode) ---
+      - key: AWS_ACCESS_KEY_ID
+        sync: false
+      - key: AWS_SECRET_ACCESS_KEY
+        sync: false
+      - key: AWS_REGION
+        value: us-east-1
+      - key: AWS_COST_TAG_KEY
+        value: server
+      # --- Optional: weekly AI summary (free-tier LLM) ---
+      - key: AI_PROVIDER
+        value: auto
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false

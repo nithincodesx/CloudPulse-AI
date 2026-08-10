@@ -27,7 +27,18 @@ export const supabase: SupabaseClient = createBrowserClient(supabaseUrl, supabas
 // Backend API calls (real backend integration). The dashboard reads through
 // the FastAPI backend; the Supabase client is used for auth + provisioning.
 // ---------------------------------------------------------------------------
-const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+// Backend API base URL. No silent localhost fallback — if it's missing we fail
+// fast so a misconfigured deploy can't quietly point the browser at localhost.
+// Set NEXT_PUBLIC_API_URL in frontend/.env.local (dev) or the Vercel dashboard
+// (production = the deployed Render URL).
+const API_URL = process.env.NEXT_PUBLIC_API_URL;
+
+if (!API_URL) {
+  throw new Error(
+    "NEXT_PUBLIC_API_URL must be set in frontend/.env.local (copy " +
+      "frontend/.env.local.example) or as a Vercel environment variable."
+  );
+}
 
 export async function fetchDashboardData(): Promise<DashboardData> {
   const res = await fetch(`${API_URL}/api/servers/status`);

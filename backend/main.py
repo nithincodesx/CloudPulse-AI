@@ -10,6 +10,7 @@ from uuid import uuid4
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
@@ -23,6 +24,7 @@ from database import (
     insert_alert,
     insert_metric,
     latest_metrics,
+    db_ping,
     list_alerts,
     list_servers,
     resolve_alert,
@@ -52,6 +54,12 @@ from models import (
 
 load_dotenv()
 
+from logging_conf import configure_logging, get_logger
+
+# Structured logging (JSON in prod, colored console in dev).
+configure_logging()
+logger = get_logger("backend.main")
+
 from contextlib import asynccontextmanager
 
 @asynccontextmanager
@@ -62,11 +70,14 @@ async def lifespan(app: FastAPI):
     if cloud_configured():
         try:
             result = sync_daily_costs(days_back=14)
-            print(f"[CloudPulse] AWS Cost Explorer sync: {result.days_synced} days, "
-                  f"{result.matched} cost rows matched, "
-                  f"{len(result.unmatched)} unmatched tags.")
+            logger.info(
+                "aws.cost.sync",
+                days_synced=result.days_synced,
+                matched=result.matched,
+                unmatched=len(result.unmatched),
+            )
         except Exception as exc:  # noqa: BLE001 - startup must not crash on AWS issues
-            print(f"[CloudPulse] [WARN] AWS Cost Explorer sync failed at startup: {exc}")
+            logger.warning("aws.cost.sync_failed_at_startup", error=str(exc))
 
     # Weekly AI summary scheduler. BackgroundScheduler runs the sync job in its
     # own thread; the job catches its own exceptions so a failed LLM call never
@@ -90,8 +101,13 @@ async def lifespan(app: FastAPI):
         replace_existing=True,
     )
     scheduler.start()
-    print(f"[CloudPulse] Weekly AI summary scheduled ({insight_dow} "
-          f"{insight_hour:02d}:{insight_minute:02d} {insight_tz}).")
+    logger.info(
+        "weekly_summary.scheduled",
+        day=insight_dow,
+        hour=insight_hour,
+        minute=insight_minute,
+        tz=insight_tz,
+    )
 
     yield
 
@@ -141,7 +157,13 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 @app.get("/health")
 def health_check():
-    return {"status": "ok"}
+    """Liveness + DB connectivity. Used by Render's health check and CI."""
+    if db_ping():
+        return {"status": "ok", "database": "connected"}
+    return JSONResponse(
+        status_code=503,
+        content={"status": "degraded", "database": "error", "detail": "Supabase unreachable"},
+    )
 
 
 def _bearer_token(request: Request) -> Optional[str]:

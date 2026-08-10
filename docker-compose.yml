@@ -1,0 +1,39 @@
+# CloudPulse AI — local dev stack.
+#
+#   docker compose up --build
+#
+# backend:   http://localhost:8000   (reads backend/.env; create it from .env.example)
+# frontend:  http://localhost:3000   (reads frontend/.env.local; create it from .env.local.example)
+#
+# Note: NEXT_PUBLIC_API_URL is used by the BROWSER, so it must be a host-reachable
+# URL (http://localhost:8000), not a container-internal hostname.
+services:
+  backend:
+    build: ./backend
+    env_file: ./backend/.env
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  frontend:
+    image: node:22-alpine
+    working_dir: /app
+    command: sh -c "npm install && npm run dev"
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+    env_file: ./frontend/.env.local
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      - frontend_node_modules:/app/node_modules
+      - frontend_next:/app/.next
+
+volumes:
+  frontend_node_modules:
+  frontend_next:

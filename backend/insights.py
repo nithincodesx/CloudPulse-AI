@@ -34,6 +34,7 @@ import httpx
 from dotenv import load_dotenv
 
 from anomaly import BASELINE_DAYS, IDLE_CPU_FLOOR, IDLE_RAM_FLOOR
+from logging_conf import get_logger
 from database import (
     get_daily_costs,
     get_latest_weekly_insight,
@@ -43,6 +44,8 @@ from database import (
     rpc_utilization,
 )
 from models import InsightGenerateResult, InsightOut
+
+logger = get_logger("backend.insights")
 
 load_dotenv()
 
@@ -294,10 +297,14 @@ def run_weekly_job() -> None:
     try:
         result = generate_weekly_summary()
         if result.generated:
-            print(f"[CloudPulse] Weekly AI summary stored "
-                  f"({result.insight.provider}/{result.insight.model}, "
-                  f"{result.insight.period_start} → {result.insight.period_end}).")
+            logger.info(
+                "weekly_summary.stored",
+                provider=result.insight.provider,
+                model=result.insight.model,
+                period_start=result.insight.period_start.isoformat(),
+                period_end=result.insight.period_end.isoformat(),
+            )
         else:
-            print(f"[CloudPulse] [WARN] Weekly AI summary skipped: {result.error}")
+            logger.warning("weekly_summary.skipped", error=result.error)
     except Exception as exc:  # noqa: BLE001 - a failed run must not kill the scheduler thread
-        print(f"[CloudPulse] [WARN] Weekly AI summary job failed: {exc}")
+        logger.warning("weekly_summary.job_failed", error=str(exc))

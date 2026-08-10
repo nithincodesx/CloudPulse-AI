@@ -249,6 +249,79 @@ providers are called over HTTP with `httpx`.
 
 ---
 
+## Deployment
+
+### Local dev with Docker
+
+```bash
+# backend/.env and frontend/.env.local must exist (copy the *.example files)
+docker compose up --build
+# backend → http://localhost:8000   frontend → http://localhost:3000
+```
+
+`NEXT_PUBLIC_API_URL` is a **browser-side** variable, so in the compose file it
+is `http://localhost:8000` (host-reachable), never a container hostname.
+
+### Backend → Render (free tier)
+
+The repo ships a [`render.yaml`](render.yaml) Blueprint: **New → Blueprint →
+pick `nithincodesx/CloudPulse-AI`**. It builds `backend/Dockerfile` (non-root,
+`python:3.13-slim`), sets `healthCheckPath: /health`, and auto-deploys on push
+to `main`.
+
+Set these in the Render dashboard (Service → Environment — they are **not** in
+git):
+
+| Variable | Notes |
+|---|---|
+| `SUPABASE_URL` | Required — your Supabase project URL |
+| `SUPABASE_SERVICE_KEY` | Required — service-role key (never exposed to the frontend) |
+| `CORS_ORIGINS` | Your deployed Vercel origin, e.g. `https://cloudpulse-ai.vercel.app` |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | Optional — real cost data |
+| `GROQ_API_KEY` / `GEMINI_API_KEY` / `AI_PROVIDER` | Optional — weekly AI summary |
+
+> **Free-tier caveat:** Render free services sleep after ~15 min idle. The first
+> request after a gap triggers a cold start (a few seconds); Render's `/health`
+> ping doubles as the wake check.
+
+### Frontend → Vercel
+
+Import the repo in Vercel (it auto-detects Next.js). Set the environment
+variables (Production):
+
+```
+NEXT_PUBLIC_SUPABASE_URL=
+NEXT_PUBLIC_SUPABASE_ANON_KEY=
+NEXT_PUBLIC_API_URL=https://<your-render-app>.onrender.com
+```
+
+`NEXT_PUBLIC_API_URL` is inlined at build time — set it before every deploy
+(it's the Render URL, **not** `localhost:8000`). The frontend fails fast at
+build/runtime if it's missing; there is no silent localhost fallback.
+
+### Database → Supabase (free tier)
+
+Already in place — `supabase-schema.sql` in the SQL Editor, RLS scoped to
+`auth.uid()`, backend access via the service-role key. Nothing to migrate.
+
+### CI (GitHub Actions)
+
+`.github/workflows/ci.yml` runs on every push/PR to `main`:
+- **Backend**: `pytest` (DB-free unit tests in `backend/tests/` — pure logic
+  only; integration tests needing real Supabase/AWS/LLM secrets are documented
+  as excluded).
+- **Frontend**: `npm ci` → `npm run build` (dummy public env vars) → Playwright
+  chromium smoke test (`/login` renders, `/` returns 200).
+
+### Health & logs
+
+- `GET /health` → `200 {"status":"ok","database":"connected"}` when Supabase is
+  reachable, else `503`. Used by Render's health check.
+- Logging is **structured** (structlog): JSON lines in production, colored
+  console in local dev. `LOG_LEVEL` (default `INFO`) tunes verbosity.
+
+---
+
 ## Features
 
 | Feature | Description |

@@ -17,6 +17,10 @@ from typing import Optional
 from dotenv import load_dotenv
 from supabase import Client, create_client
 
+from logging_conf import get_logger
+
+logger = get_logger("backend.database")
+
 load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -47,13 +51,23 @@ def init_db():
     """
     try:
         _supabase.table("servers").select("id").limit(1).execute()
-        print("[CloudPulse] Supabase connected — schema OK.")
+        logger.info("db.connected", provider="supabase")
     except Exception as exc:
         raise RuntimeError(
             "Could not reach Supabase. Check SUPABASE_URL/SUPABASE_SERVICE_KEY and "
             "that supabase-schema.sql has been applied in the SQL Editor. "
             f"({exc})"
         ) from exc
+
+
+def db_ping() -> bool:
+    """Lightweight connectivity check for /health. Never raises."""
+    try:
+        _supabase.table("servers").select("id").limit(1).execute()
+        return True
+    except Exception as exc:  # noqa: BLE001 - health endpoint must not 500
+        logger.warning("health.db_ping.failed", error=str(exc))
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +155,7 @@ def rpc_baseline(server_id: str, days: int) -> dict | None:
             {"p_server_id": server_id, "p_days": days},
         ).execute().data
     except Exception as exc:  # noqa: BLE001 - degrade gracefully on missing RPC
-        print(f"[CloudPulse] [WARN] metrics_baseline RPC failed: {exc}")
+        logger.warning("rpc.metrics_baseline.failed", error=str(exc))
         return None
     if not rows:
         return None
@@ -161,7 +175,7 @@ def rpc_utilization(server_id: str, days: int, cpu_floor: float, ram_floor: floa
             },
         ).execute().data
     except Exception as exc:  # noqa: BLE001
-        print(f"[CloudPulse] [WARN] metrics_utilization RPC failed: {exc}")
+        logger.warning("rpc.metrics_utilization.failed", error=str(exc))
         return None
     if not rows:
         return None
