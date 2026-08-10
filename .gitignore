@@ -1,0 +1,58 @@
+# ── Secrets ─────────────────────────────────────────────────────────────
+# Never commit real credentials. Only .env.example placeholders are tracked.
+.env
+.env.*
+!.env.example
+!.env.local.example
+*.pem
+*.key
+*.p12
+*.p8
+*.crt
+
+# ── Python ──────────────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ── Node / Next.js ──────────────────────────────────────────────────────
+node_modules/
+.next/
+out/
+dist/
+build/
+.turbo/
+*.tsbuildinfo
+
+# ── Databases & runtime data ────────────────────────────────────────────
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.sqlite-journal
+
+# ── Local tooling / preview artifacts ───────────────────────────────────
+.freebuff/
+
+# ── Logs ────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── OS & editors ────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/
+*.swp
