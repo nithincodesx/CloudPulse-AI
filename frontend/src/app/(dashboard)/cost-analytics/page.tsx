@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import {
   DollarSign,
   TrendingDown,
@@ -9,13 +9,15 @@ import {
   AlertTriangle,
   RefreshCw,
   PlugZap,
+  Sparkles,
+  Loader2,
 } from "lucide-react";
 import { useDashboard } from "@/lib/DashboardContext";
 import KpiCard from "@/components/KpiCard";
 import CostModeBadge from "@/components/CostModeBadge";
 import ServerTable from "@/components/ServerTable";
-import { fetchCloudStatus, triggerCostSync } from "@/lib/supabase";
-import type { DailyCost } from "@/lib/types";
+import { fetchCloudStatus, fetchLatestInsight, generateInsight, triggerCostSync } from "@/lib/supabase";
+import type { DailyCost, WeeklyInsight } from "@/lib/types";
 import {
   ResponsiveContainer,
   AreaChart,
@@ -54,6 +56,38 @@ export default function CostAnalyticsPage() {
   const [syncMsg, setSyncMsg] = useState<string | null>(null);
   const [testing, setTesting] = useState(false);
   const [testMsg, setTestMsg] = useState<string | null>(null);
+
+  // Weekly AI summary panel
+  const [insight, setInsight] = useState<WeeklyInsight | null>(null);
+  const [insightLoading, setInsightLoading] = useState(true);
+  const [generating, setGenerating] = useState(false);
+  const [insightError, setInsightError] = useState<string | null>(null);
+
+  useEffect(() => {
+    fetchLatestInsight()
+      .then((i) => {
+        setInsight(i);
+        setInsightLoading(false);
+      })
+      .catch(() => setInsightLoading(false));
+  }, []);
+
+  const handleGenerate = async () => {
+    setGenerating(true);
+    setInsightError(null);
+    try {
+      const result = await generateInsight();
+      if (result.generated && result.insight) {
+        setInsight(result.insight);
+      } else {
+        setInsightError(result.error ?? "Summary generation failed");
+      }
+    } catch (e) {
+      setInsightError(e instanceof Error ? e.message : "Summary generation failed");
+    } finally {
+      setGenerating(false);
+    }
+  };
 
   if (loading && !data) {
     return <div className="p-6 text-paper/50">Loading analytics...</div>;
@@ -263,6 +297,90 @@ export default function CostAnalyticsPage() {
             </ol>
           </div>
         )}
+      </section>
+
+      {/* ============================================================== */}
+      {/* AI Weekly Summary                                                */}
+      {/* ============================================================== */}
+      <section className="glass-panel p-6">
+        <div className="mb-5 flex flex-wrap items-start justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <div
+              className="flex h-9 w-9 items-center justify-center rounded-xl"
+              style={{
+                background: "rgba(200,168,255,0.08)",
+                border: "1px solid rgba(200,168,255,0.15)",
+                boxShadow: "0 0 12px rgba(200,168,255,0.08)",
+              }}
+            >
+              <Sparkles size={16} className="text-accent-purple" />
+            </div>
+            <div>
+              <h3 className="text-base font-bold text-paper font-heading">AI Weekly Summary</h3>
+              <p className="text-[10px] font-mono font-medium mt-0.5" style={{ color: "rgba(244,240,230,0.3)" }}>
+                LLM-written plain-English recap of the week
+              </p>
+            </div>
+          </div>
+          <button
+            onClick={handleGenerate}
+            disabled={generating}
+            className="inline-flex items-center gap-2 rounded-xl px-4 py-2 text-[11px] font-mono font-semibold uppercase tracking-wider transition-all disabled:opacity-50"
+            style={{
+              background: "rgba(200,168,255,0.08)",
+              color: "#c8a8ff",
+              border: "1px solid rgba(200,168,255,0.2)",
+            }}
+          >
+            {generating ? <Loader2 size={13} className="animate-spin" /> : <Sparkles size={13} />}
+            {generating ? "Generating…" : "Generate weekly summary"}
+          </button>
+        </div>
+
+        {insightError && (
+          <div
+            className="mb-4 rounded-xl px-4 py-3 text-[12px]"
+            style={{
+              background: "rgba(232,70,44,0.08)",
+              color: "rgba(244,240,230,0.8)",
+              border: "1px solid rgba(232,70,44,0.2)",
+            }}
+          >
+            <span className="font-semibold text-accent-red">Could not generate:</span> {insightError}
+          </div>
+        )}
+
+        {insightLoading ? (
+          <div className="flex items-center gap-3 py-8 text-sm" style={{ color: "rgba(244,240,230,0.3)" }}>
+            <Loader2 size={15} className="animate-spin" /> Loading latest summary…
+          </div>
+        ) : insight ? (
+          <div>
+            <p className="whitespace-pre-wrap text-sm leading-relaxed" style={{ color: "rgba(244,240,230,0.85)" }}>
+              {insight.summary}
+            </p>
+            <p className="mt-4 text-[10px] font-mono" style={{ color: "rgba(244,240,230,0.3)" }}>
+              Week of {insight.period_start} → {insight.period_end} · {insight.provider}/{insight.model} ·{" "}
+              {insight.meta.server_count ?? "—"} servers · {insight.meta.alert_count ?? 0} alerts · total cost $
+              {(insight.meta.total_cost ?? 0).toFixed(2)}
+            </p>
+          </div>
+        ) : (
+          <div className="rounded-xl px-4 py-6 text-center" style={{ background: "rgba(244,240,230,0.02)" }}>
+            <p className="text-sm font-medium" style={{ color: "rgba(244,240,230,0.4)" }}>
+              No weekly summary yet
+            </p>
+            <p className="mt-1 text-[11px] font-mono" style={{ color: "rgba(244,240,230,0.3)" }}>
+              The job runs every Monday at 09:00 UTC — or press “Generate weekly summary” now.
+            </p>
+          </div>
+        )}
+
+        <p className="mt-5 border-t pt-3 text-[10px] font-mono leading-relaxed" style={{ color: "rgba(244,240,230,0.25)", borderColor: "rgba(244,240,230,0.06)" }}>
+          Anomaly detection uses statistical z-scores over a 7-day rolling baseline — not machine learning. This
+          summary is written by an LLM from real alerts and AWS Cost Explorer data (costs lag 24–48h); it never
+          invents figures.
+        </p>
       </section>
 
       {/* ============================================================== */}

@@ -26,6 +26,7 @@ from database import (
     list_alerts,
     list_servers,
     resolve_alert,
+    rpc_baseline,
     update_server_status,
 )
 from aws_cost import (
@@ -34,9 +35,13 @@ from aws_cost import (
     get_cloud_status,
     sync_daily_costs,
 )
+from anomaly import BASELINE_DAYS, baseline_from_rpc, check_anomalies, most_severe
+from insights import generate_weekly_summary, get_latest_summary, run_weekly_job
 from models import (
     AlertResolveResponse,
     CloudStatus,
+    InsightGenerateResult,
+    InsightOut,
     MetricPayload,
     MetricResponse,
     ServerOut,
@@ -62,7 +67,35 @@ async def lifespan(app: FastAPI):
                   f"{len(result.unmatched)} unmatched tags.")
         except Exception as exc:  # noqa: BLE001 - startup must not crash on AWS issues
             print(f"[CloudPulse] [WARN] AWS Cost Explorer sync failed at startup: {exc}")
+
+    # Weekly AI summary scheduler. BackgroundScheduler runs the sync job in its
+    # own thread; the job catches its own exceptions so a failed LLM call never
+    # kills the scheduler. NOTE: single-worker deployment assumed — with multiple
+    # uvicorn workers the cron job would fire once per worker.
+    from apscheduler.schedulers.background import BackgroundScheduler  # noqa: PLC0415
+
+    insight_dow = os.getenv("WEEKLY_INSIGHT_DOW", "mon")
+    insight_hour = int(os.getenv("WEEKLY_INSIGHT_HOUR", "9"))
+    insight_minute = int(os.getenv("WEEKLY_INSIGHT_MINUTE", "0"))
+    insight_tz = os.getenv("WEEKLY_INSIGHT_TZ", "UTC")
+
+    scheduler = BackgroundScheduler(timezone=insight_tz)
+    scheduler.add_job(
+        run_weekly_job,
+        "cron",
+        day_of_week=insight_dow,
+        hour=insight_hour,
+        minute=insight_minute,
+        id="weekly_ai_summary",
+        replace_existing=True,
+    )
+    scheduler.start()
+    print(f"[CloudPulse] Weekly AI summary scheduled ({insight_dow} "
+          f"{insight_hour:02d}:{insight_minute:02d} {insight_tz}).")
+
     yield
+
+    scheduler.shutdown(wait=False)
 
 app = FastAPI(
     title="CloudPulse AI",
@@ -93,74 +126,13 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # ---------------------------------------------------------------------------
-# Thresholds (tunable via env vars in production)
+# Anomaly detection
 # ---------------------------------------------------------------------------
-CPU_HIGH_THRESHOLD = float(os.getenv("CPU_HIGH_THRESHOLD", "85.0"))
-IDLE_CPU_THRESHOLD = float(os.getenv("IDLE_CPU_THRESHOLD", "5.0"))
-IDLE_RAM_THRESHOLD = float(os.getenv("IDLE_RAM_THRESHOLD", "10.0"))
-NETWORK_ANOMALY_THRESHOLD = float(os.getenv("NETWORK_ANOMALY_THRESHOLD", "500.0"))
-
-
-def _check_thresholds(server_id: str, cpu: float, ram: float, network: float) -> bool:
-    """Evaluate metric payload against anomaly thresholds.
-    Returns True when at least one alert was written.
-
-    Cost thresholds are intentionally NOT evaluated here — real spend lives in
-    daily_costs (AWS Cost Explorer), and BUDGET_SPIKE fires on real daily-cost
-    spikes via detect_budget_spikes() during a cloud sync.
-    """
-    triggered = False
-    now = datetime.now(timezone.utc).isoformat()
-
-    # --- HIGH_CPU ---
-    if cpu > CPU_HIGH_THRESHOLD:
-        insert_alert(
-            {
-                "server_id": server_id,
-                "alert_type": "HIGH_CPU",
-                "message": f"CPU spike detected: {cpu:.1f}% (threshold {CPU_HIGH_THRESHOLD}%)",
-                "created_at": now,
-            }
-        )
-        # Also escalate server status to critical
-        update_server_status(server_id, "critical")
-        triggered = True
-
-    # --- IDLE_RESOURCE ---
-    if cpu < IDLE_CPU_THRESHOLD and ram < IDLE_RAM_THRESHOLD:
-        insert_alert(
-            {
-                "server_id": server_id,
-                "alert_type": "IDLE_RESOURCE",
-                "message": (
-                    f"Server appears idle — CPU {cpu:.1f}% / RAM {ram:.1f}%. "
-                    "Consider downsizing or shutting down."
-                ),
-                "created_at": now,
-            }
-        )
-        # Flag server as idle
-        update_server_status(server_id, "idle")
-        triggered = True
-
-    # --- NETWORK_ANOMALY ---
-    if network > NETWORK_ANOMALY_THRESHOLD:
-        insert_alert(
-            {
-                "server_id": server_id,
-                "alert_type": "NETWORK_ANOMALY",
-                "message": (
-                    f"Network traffic spike: {network:.2f} MB "
-                    f"(threshold {NETWORK_ANOMALY_THRESHOLD} MB) — "
-                    "investigate potential DDoS or data exfiltration."
-                ),
-                "created_at": now,
-            }
-        )
-        update_server_status(server_id, "warning")
-        triggered = True
-
-    return triggered
+# Static thresholds were replaced by a rolling baseline: per server, per metric,
+# a 7-day mean/stddev is aggregated in Postgres (metrics_baseline RPC) and the
+# latest sample is flagged by z-score (see backend/anomaly.py). This is
+# statistics, not ML. BUDGET_SPIKE still fires on real daily-cost spikes via
+# detect_budget_spikes() during a cloud sync.
 
 
 # ---------------------------------------------------------------------------
@@ -205,12 +177,29 @@ def ingest_metrics(request: Request, payload: MetricPayload):
         }
     )
 
-    alert_triggered = _check_thresholds(
+    # Rolling-baseline anomaly detection (statistical z-scores, not ML).
+    # A missing RPC / empty baseline degrades to "no anomaly claims".
+    baseline = baseline_from_rpc(rpc_baseline(server_id, BASELINE_DAYS))
+    anomalies = check_anomalies(
         server_id,
         payload.cpu_usage,
         payload.ram_usage,
         payload.network_traffic,
+        baseline,
     )
+    for anomaly in anomalies:
+        insert_alert(
+            {
+                "server_id": server_id,
+                "alert_type": anomaly["alert_type"],
+                "message": anomaly["message"],
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+    if anomalies:
+        # Apply the most severe status only (critical > warning > idle).
+        update_server_status(server_id, most_severe([a["status"] for a in anomalies]))
+    alert_triggered = bool(anomalies)
 
     return MetricResponse(
         id=row.get("id", uuid4()),
@@ -267,7 +256,11 @@ def server_status():
     hourly_cost_estimate = 0.0
 
     if cloud.cost_source == "aws_cost_explorer":
-        daily_rows = get_daily_costs(days=30)
+        # Per-server loop: get_daily_costs(server_id=None, days=N) would apply
+        # PostgREST's .limit(N) across ALL servers, truncating multi-node fleets.
+        daily_rows: list[dict] = []
+        for s in servers:
+            daily_rows += get_daily_costs(server_id=s["id"], days=30)
         for row in daily_rows:
             costs_map.setdefault(row["server_id"], []).append(row)
         month_start = datetime.now(timezone.utc).strftime("%Y-%m-01")
@@ -345,6 +338,29 @@ def cloud_sync():
                     "created_at": datetime.now(timezone.utc).isoformat(),
                 }
             )
+    return result
+
+
+@app.get("/api/insights/latest", response_model=InsightOut)
+def latest_insight():
+    """Return the most recent weekly AI summary (404 when none exists yet)."""
+    insight = get_latest_summary()
+    if not insight:
+        raise HTTPException(status_code=404, detail="No weekly AI summary generated yet")
+    return insight
+
+
+@app.post("/api/insights/generate", response_model=InsightGenerateResult)
+@limiter.limit("2/minute")
+def generate_insight(request: Request):
+    """Generate (or refresh) the weekly AI summary on demand.
+
+    Returns 503 with a distinguishing message when the LLM is unconfigured, the
+    key is invalid, or the provider is rate-limited — never a silent fake.
+    """
+    result = generate_weekly_summary()
+    if not result.generated:
+        raise HTTPException(status_code=503, detail=result.error or "Summary generation failed")
     return result
 
 

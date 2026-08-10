@@ -7,3 +7,4 @@ pydantic==2.10.6
 httpx==0.28.1
 slowapi==0.1.9
 boto3==1.35.83
+apscheduler==3.10.4

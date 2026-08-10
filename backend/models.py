@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Optional
 from uuid import UUID
 
@@ -96,3 +96,24 @@ class AlertResolveResponse(BaseModel):
     message: str
     resolved: bool
     created_at: datetime
+
+
+# ---------------------------------------------------------------------------
+# Weekly AI insights
+# ---------------------------------------------------------------------------
+
+class InsightOut(BaseModel):
+    id: UUID
+    period_start: date
+    period_end: date
+    summary: str
+    provider: str | None = None
+    model: str | None = None
+    meta: dict = {}  # server_count, alert_count, total_cost, generation_ms
+    generated_at: datetime | None = None
+
+
+class InsightGenerateResult(BaseModel):
+    generated: bool = False
+    insight: InsightOut | None = None
+    error: str | None = None

@@ -128,6 +128,46 @@ def latest_metrics(server_id: str, limit: int = 10) -> list[dict]:
     return rows
 
 
+def rpc_baseline(server_id: str, days: int) -> dict | None:
+    """Run the ``metrics_baseline`` aggregate (7-day mean/stddev per metric).
+
+    Returns ``None`` when the function is unavailable or returns no rows — the
+    caller must treat that as "no baseline, make no anomaly claims" rather than
+    erroring. Never raises.
+    """
+    try:
+        rows = _supabase.rpc(
+            "metrics_baseline",
+            {"p_server_id": server_id, "p_days": days},
+        ).execute().data
+    except Exception as exc:  # noqa: BLE001 - degrade gracefully on missing RPC
+        print(f"[CloudPulse] [WARN] metrics_baseline RPC failed: {exc}")
+        return None
+    if not rows:
+        return None
+    return rows[0]
+
+
+def rpc_utilization(server_id: str, days: int, cpu_floor: float, ram_floor: float) -> dict | None:
+    """Run the ``metrics_utilization`` aggregate (idle-sample fraction over a window)."""
+    try:
+        rows = _supabase.rpc(
+            "metrics_utilization",
+            {
+                "p_server_id": server_id,
+                "p_days": days,
+                "p_cpu_floor": cpu_floor,
+                "p_ram_floor": ram_floor,
+            },
+        ).execute().data
+    except Exception as exc:  # noqa: BLE001
+        print(f"[CloudPulse] [WARN] metrics_utilization RPC failed: {exc}")
+        return None
+    if not rows:
+        return None
+    return rows[0]
+
+
 # ---------------------------------------------------------------------------
 # Daily costs (real spend, from AWS Cost Explorer)
 # ---------------------------------------------------------------------------
@@ -233,3 +273,33 @@ def resolve_alert(alert_id: str) -> dict:
         row["resolved"] = bool(row["resolved"])
         return row
     return {}
+
+
+# ---------------------------------------------------------------------------
+# Weekly AI insights
+# ---------------------------------------------------------------------------
+
+def insert_weekly_insight(payload: dict) -> dict:
+    """Upsert a weekly insight (idempotent on period_start + period_end)."""
+    if "id" not in payload:
+        payload["id"] = str(uuid.uuid4())
+    row = (
+        _supabase.table("weekly_insights")
+        .upsert(payload, on_conflict="period_start,period_end")
+        .execute()
+        .data[0]
+    )
+    return row
+
+
+def get_latest_weekly_insight() -> dict | None:
+    """Return the most recently generated weekly insight (or None)."""
+    rows = (
+        _supabase.table("weekly_insights")
+        .select("*")
+        .order("generated_at", desc=True)
+        .limit(1)
+        .execute()
+        .data
+    )
+    return rows[0] if rows else None

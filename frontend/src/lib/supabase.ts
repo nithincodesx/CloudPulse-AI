@@ -1,6 +1,13 @@
 import { createBrowserClient } from "@supabase/ssr";
 import type { SupabaseClient } from "@supabase/supabase-js";
-import type { DashboardData, Alert, CloudStatus, SyncResult } from "./types";
+import type {
+  DashboardData,
+  Alert,
+  CloudStatus,
+  SyncResult,
+  WeeklyInsight,
+  InsightGenerateResult,
+} from "./types";
 
 // Browser Supabase client — powers auth (login/magic link) and owns-server
 // provisioning. Env vars are injected at build time via NEXT_PUBLIC_*.
@@ -56,6 +63,28 @@ export async function triggerCostSync(): Promise<SyncResult> {
   const res = await fetch(`${API_URL}/api/cloud/sync`, { method: "POST" });
   if (!res.ok) {
     let detail = `Sync failed (${res.status})`;
+    try {
+      const body = await res.json();
+      detail = body.detail ?? detail;
+    } catch {
+      // non-JSON error body
+    }
+    throw new Error(detail);
+  }
+  return await res.json();
+}
+
+export async function fetchLatestInsight(): Promise<WeeklyInsight | null> {
+  const res = await fetch(`${API_URL}/api/insights/latest`);
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error("Failed to fetch weekly insight");
+  return await res.json();
+}
+
+export async function generateInsight(): Promise<InsightGenerateResult> {
+  const res = await fetch(`${API_URL}/api/insights/generate`, { method: "POST" });
+  if (!res.ok) {
+    let detail = `Generation failed (${res.status})`;
     try {
       const body = await res.json();
       detail = body.detail ?? detail;

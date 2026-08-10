@@ -172,6 +172,83 @@ also flags **budget spikes** — a node whose latest daily cost exceeds 2× its
 
 ---
 
+## Statistical anomaly detection (rolling baseline, not ML)
+
+The old hardcoded cutoffs (`CPU > 85`, `network > 500 MB`, …) are gone. The
+backend now computes a **rolling baseline** per server per metric — the mean and
+population stddev of the last `BASELINE_DAYS` (default 7) of `server_metrics` —
+as a Postgres aggregate (`metrics_baseline` RPC), and flags the latest sample by
+**z-score**:
+
+- **HIGH_CPU** — cpu z-score `> ANOMALY_Z_SCORE` (default 3.0), or the metric is
+  pegged at ~100% on a flat baseline → status `critical`
+- **NETWORK_ANOMALY** — network z-score `> NETWORK_Z_SCORE` (default 4.0 — a
+  separate, higher knob because network traffic is bursty) → status `warning`
+- **IDLE_RESOURCE** — cpu `< IDLE_CPU_FLOOR` **and** ram `< IDLE_RAM_FLOOR`
+  (defaults 5 / 10). Idle is an absolute low-utilization **floor**, not an
+  anomaly: a chronically idle node has a flat, already-low baseline that
+  z-scores can't see.
+
+Honesty rules baked in:
+- **Warmup**: a server needs ≥ `BASELINE_MIN_SAMPLES` (default 10) points in the
+  window before any z-score claim is made. No baseline ⇒ no claim.
+- **This is statistics, not ML.** There is no trained model; z-scores against a
+  rolling mean/stddev are classic statistical process control. The only "AI" is
+  the weekly summary (below), which *summarizes* these results and real cost
+  data — it never produces numbers itself.
+- Multiple anomalies on one ingest collapse to the most severe status
+  (`critical > warning > idle`).
+
+Config: `ANOMALY_Z_SCORE`, `NETWORK_Z_SCORE`, `BASELINE_DAYS`,
+`BASELINE_MIN_SAMPLES`, `IDLE_CPU_FLOOR`, `IDLE_RAM_FLOOR` in `backend/.env`
+(see `.env.example`).
+
+## Weekly AI summary (free-tier LLM)
+
+A scheduled job (APScheduler, weekly cron — default **Mon 09:00 UTC**, tunable
+via `WEEKLY_INSIGHT_DOW/HOUR/MINUTE/TZ`) gathers a week of **real** data and asks
+a free-tier LLM to write a plain-English recap:
+
+- per-server utilization (idle % from `metrics_utilization`, avg CPU/RAM)
+- real cost per server this week vs prior week (from `daily_costs`)
+- the week's alerts (type, server, message)
+
+…and stores the result in the `weekly_insights` table (idempotent on
+`period_start + period_end`). Example output: *"db-primary-01 was idle 40% of the
+time, costing ~$12 for nothing this week — consider downsizing."*
+
+### Providers (pick one — both are free-tier)
+
+| Provider | Env | Model |
+|---|---|---|
+| Groq | `GROQ_API_KEY` | `llama-3.1-8b-instant` (default) |
+| Gemini | `GEMINI_API_KEY` | `gemini-2.5-flash` (default) |
+
+`AI_PROVIDER` can be `groq`, `gemini`, or `auto` (default: Groq if its key is
+set, else Gemini). Override the model with `AI_MODEL`. No extra SDKs — both
+providers are called over HTTP with `httpx`.
+
+### Honesty
+
+- The LLM is a **summarizer, not a source of numbers** — every figure in its
+  prompt comes from telemetry / Cost Explorer / alerts, and the prompt forbids
+  inventing values.
+- The prompt (and the UI panel) state that anomaly detection is **statistical
+  z-scores, not ML**, and that Cost Explorer lags 24–48h.
+- Without a key the job reports *"LLM not configured"* — it never fabricates a
+  summary.
+
+### Triggering
+
+- **Scheduled**: weekly cron (see above).
+- **On demand**: `POST /api/insights/generate` (rate-limited to 2/min) — returns
+  a stored summary or a `503` with the real reason (unconfigured / bad key /
+  rate-limited).
+- **Read**: `GET /api/insights/latest` returns the most recent summary (404 when
+  none exists yet).
+
+---
+
 ## Features
 
 | Feature | Description |
@@ -185,6 +262,8 @@ also flags **budget spikes** — a node whose latest daily cost exceeds 2× its
 | **Real-time KPI cards** | Active nodes, avg CPU, monthly spend, alert count |
 | **Interactive charts** | CPU & RAM area chart with per-server filtering |
 | **Live alert feed** | HIGH_CPU, IDLE_RESOURCE, BUDGET_SPIKE alerts with dismiss |
+| **Statistical anomaly detection** | Per-server rolling 7-day baseline, z-score flags — honest that it's not ML |
+| **Weekly AI summary** | Scheduled job summarizes real alerts + cost deltas via free-tier Groq/Gemini |
 | **AWS Cost Explorer** | Read-only integration pulls real daily spend per resource tag |
 | **Honest cost modes** | Real data with a green badge, or simulated mode showing `$0` + connect prompt — never fabricated numbers |
 | **Budget spike detection** | Real daily-cost spikes (>2× 14-day mean) raise BUDGET_SPIKE alerts |
@@ -200,6 +279,8 @@ also flags **budget spikes** — a node whose latest daily cost exceeds 2× its
 | `GET` | `/api/servers/{id}/metrics` | Historical metrics for one server |
 | `GET` | `/api/cloud/status` | AWS Cost Explorer connection status |
 | `POST` | `/api/cloud/sync` | Pull daily cost from Cost Explorer & flag budget spikes |
+| `GET` | `/api/insights/latest` | Most recent weekly AI summary (404 when none) |
+| `POST` | `/api/insights/generate` | Generate the weekly AI summary on demand (rate-limited) |
 | `GET` | `/health` | Health check |
 
 > Backend dashboard endpoints (`GET /api/servers/*`) are intentionally left open
