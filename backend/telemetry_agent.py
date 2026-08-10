@@ -23,20 +23,21 @@ import httpx
 # ---------------------------------------------------------------------------
 
 def collect_metrics() -> dict:
-    """Return a snapshot of current host metrics."""
+    """Return a snapshot of current host metrics.
+
+    Cost is intentionally NOT reported here — real spend is pulled from
+    AWS Cost Explorer by the backend and stored in daily_costs. Fabricating a
+    per-metric cost would present fake numbers as real.
+    """
     cpu = psutil.cpu_percent(interval=0.5)
     ram = psutil.virtual_memory().percent
     net = psutil.net_io_counters()
     network_mb = (net.bytes_sent + net.bytes_recv) / (1024 * 1024)
 
-    # Simple cost heuristic: ~$0.01 per 1% CPU-hour baseline
-    estimated_cost = round(cpu * 0.0001 * (ram / 100), 6)
-
     return {
         "cpu_usage": round(cpu, 1),
         "ram_usage": round(ram, 1),
         "network_traffic": round(network_mb, 2),
-        "estimated_cost_per_hour": estimated_cost,
     }
 
 
@@ -49,6 +50,7 @@ def run_agent(token: str, api_url: str, interval: int) -> NoReturn:
     print(f"[CloudPulse Agent] Token:      {token[:12]}… (server identified by token)")
     print(f"[CloudPulse Agent] API:        {api_url}/api/metrics")
     print(f"[CloudPulse Agent] Interval:   {interval}s")
+    print(f"[CloudPulse Agent] Cost:       supplied by backend (AWS Cost Explorer when connected)")
     print("-" * 56)
 
     headers = {"Authorization": f"Bearer {token}"}
@@ -67,8 +69,7 @@ def run_agent(token: str, api_url: str, interval: int) -> NoReturn:
                     f"[{time.strftime('%H:%M:%S')}] "
                     f"CPU {metrics['cpu_usage']:5.1f}% | "
                     f"RAM {metrics['ram_usage']:5.1f}% | "
-                    f"Net {metrics['network_traffic']:6.2f} MB | "
-                    f"$ {metrics['estimated_cost_per_hour']:.6f}/h"
+                    f"Net {metrics['network_traffic']:6.2f} MB"
                     f"{alert_flag}"
                 )
 

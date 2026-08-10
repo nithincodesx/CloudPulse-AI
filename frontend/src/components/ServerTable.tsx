@@ -13,7 +13,6 @@ import {
 interface MetricRow {
   cpu_usage: number;
   ram_usage: number;
-  estimated_cost_per_hour: number;
 }
 
 interface ServerRow {
@@ -27,6 +26,8 @@ interface ServerRow {
     type?: string;
   };
   latest_metric?: MetricRow;
+  /** Real month-to-date cost from AWS Cost Explorer (undefined = simulated mode). */
+  monthly_cost?: number;
 }
 
 interface ServerTableProps {
@@ -45,8 +46,9 @@ const statusMeta: Record<
   idle:     { label: "Idle",     color: "#8a8780", dotColor: "#6b6960" },
 };
 
-function projectedSavings(costPerHour: number): number {
-  return Math.round(costPerHour * 0.5 * 730 * 100) / 100;
+function projectedSavings(monthlyCost: number): number {
+  // Downsizing underutilized nodes by half their real monthly spend.
+  return Math.round(monthlyCost * 0.5 * 100) / 100;
 }
 
 function MetricBar({ value, color }: { value: number; color: string }) {
@@ -62,12 +64,8 @@ function MetricBar({ value, color }: { value: number; color: string }) {
 
 export default function ServerTable({ servers, onAction, onRowClick }: ServerTableProps) {
   const totalSavings = servers
-    .filter((s) => s.status === "idle" || s.status === "warning")
-    .reduce(
-      (acc, s) =>
-        acc + projectedSavings(s.latest_metric?.estimated_cost_per_hour ?? 0),
-      0
-    );
+    .filter((s) => (s.status === "idle" || s.status === "warning") && s.monthly_cost != null)
+    .reduce((acc, s) => acc + projectedSavings(s.monthly_cost ?? 0), 0);
 
   return (
     <div className="space-y-5">
@@ -112,7 +110,7 @@ export default function ServerTable({ servers, onAction, onRowClick }: ServerTab
         <table className="w-full text-left text-sm">
           <thead>
             <tr style={{ borderBottom: "1px solid rgba(244,240,230,0.06)" }}>
-              {["Node", "Status", "CPU", "RAM", "Monthly Est.", "Savings", "Action"].map(
+              {["Node", "Status", "CPU", "RAM", "Cost (MTD)", "Savings", "Action"].map(
                 (h, i) => (
                   <th
                     key={h}
@@ -129,11 +127,11 @@ export default function ServerTable({ servers, onAction, onRowClick }: ServerTab
             {servers.map((s) => {
               const meta = statusMeta[s.status] ?? statusMeta.active;
               const m = s.latest_metric;
-              const cost = m?.estimated_cost_per_hour ?? 0;
-              const monthly = Math.round(cost * 730 * 100) / 100;
+              const monthly = s.monthly_cost ?? 0;
+              const hasCost = s.monthly_cost != null;
               const savings =
-                s.status === "idle" || s.status === "warning"
-                  ? projectedSavings(cost)
+                hasCost && (s.status === "idle" || s.status === "warning")
+                  ? projectedSavings(monthly)
                   : 0;
 
               return (
@@ -229,9 +227,13 @@ export default function ServerTable({ servers, onAction, onRowClick }: ServerTab
                     </div>
                   </td>
 
-                  {/* Monthly */}
-                  <td className="px-5 py-4 font-mono text-sm font-medium" style={{ color: "rgba(244,240,230,0.6)" }}>
-                    ${monthly.toFixed(2)}
+                  {/* Monthly (real spend) */}
+                  <td
+                    className="px-5 py-4 font-mono text-sm font-medium"
+                    style={{ color: hasCost ? "rgba(244,240,230,0.6)" : "rgba(244,240,230,0.15)" }}
+                    title={hasCost ? "Real month-to-date cost (AWS Cost Explorer)" : "Connect a cloud account to see real spend"}
+                  >
+                    {hasCost ? `$${monthly.toFixed(2)}` : "—"}
                   </td>
 
                   {/* Savings */}

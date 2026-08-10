@@ -11,6 +11,8 @@ interface KpiCardProps {
   trendLabel?: string;
   highlight?: boolean;
   accent?: string;
+  /** Optional status badge (e.g. cost-mode label) rendered under the label. */
+  badge?: React.ReactNode;
 }
 
 const trendMeta: Record<string, { color: string; icon: React.ReactNode }> = {
@@ -27,19 +29,21 @@ export default function KpiCard({
   trend,
   trendLabel,
   highlight = false,
+  badge,
 }: KpiCardProps) {
   return (
     <div className="premium-pill group cursor-default">
       <div className="dark-tile flex flex-col gap-4 p-5 rounded-[16px]">
         {/* Header row */}
         <div className="flex items-start justify-between relative z-10">
-          <div className="space-y-0.5">
+          <div className="space-y-1.5">
             <p
               className="text-[10px] font-mono font-medium tracking-[0.28em] uppercase"
               style={{ color: "rgba(244,240,230,0.45)" }}
             >
               {label}
             </p>
+            {badge}
           </div>
           <div
             className={`flex h-10 w-10 items-center justify-center rounded-xl ${

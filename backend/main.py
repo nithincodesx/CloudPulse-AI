@@ -15,6 +15,8 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
 from database import (
+    get_daily_costs,
+    get_latest_cost_date,
     get_server,
     get_server_by_token,
     init_db,
@@ -26,13 +28,21 @@ from database import (
     resolve_alert,
     update_server_status,
 )
+from aws_cost import (
+    cloud_configured,
+    detect_budget_spikes,
+    get_cloud_status,
+    sync_daily_costs,
+)
 from models import (
     AlertResolveResponse,
+    CloudStatus,
     MetricPayload,
     MetricResponse,
     ServerOut,
     ServerStatusResponse,
     ServerStatusUpdate,
+    SyncResult,
 )
 
 load_dotenv()
@@ -43,6 +53,15 @@ from contextlib import asynccontextmanager
 async def lifespan(app: FastAPI):
     # Verify Supabase connectivity (schema applied via supabase-schema.sql)
     init_db()
+    # Best-effort: pull real costs once at startup when AWS is configured.
+    if cloud_configured():
+        try:
+            result = sync_daily_costs(days_back=14)
+            print(f"[CloudPulse] AWS Cost Explorer sync: {result.days_synced} days, "
+                  f"{result.matched} cost rows matched, "
+                  f"{len(result.unmatched)} unmatched tags.")
+        except Exception as exc:  # noqa: BLE001 - startup must not crash on AWS issues
+            print(f"[CloudPulse] [WARN] AWS Cost Explorer sync failed at startup: {exc}")
     yield
 
 app = FastAPI(
@@ -82,9 +101,14 @@ IDLE_RAM_THRESHOLD = float(os.getenv("IDLE_RAM_THRESHOLD", "10.0"))
 NETWORK_ANOMALY_THRESHOLD = float(os.getenv("NETWORK_ANOMALY_THRESHOLD", "500.0"))
 
 
-def _check_thresholds(server_id: str, cpu: float, ram: float, cost: float, network: float) -> bool:
+def _check_thresholds(server_id: str, cpu: float, ram: float, network: float) -> bool:
     """Evaluate metric payload against anomaly thresholds.
-    Returns True when at least one alert was written."""
+    Returns True when at least one alert was written.
+
+    Cost thresholds are intentionally NOT evaluated here — real spend lives in
+    daily_costs (AWS Cost Explorer), and BUDGET_SPIKE fires on real daily-cost
+    spikes via detect_budget_spikes() during a cloud sync.
+    """
     triggered = False
     now = datetime.now(timezone.utc).isoformat()
 
@@ -117,22 +141,6 @@ def _check_thresholds(server_id: str, cpu: float, ram: float, cost: float, netwo
         )
         # Flag server as idle
         update_server_status(server_id, "idle")
-        triggered = True
-
-    # --- BUDGET_SPIKE (simple heuristic: cost > 2× estimated baseline) ---
-    # In production you'd compare against a rolling window average
-    if cost > 2.0:
-        insert_alert(
-            {
-                "server_id": server_id,
-                "alert_type": "BUDGET_SPIKE",
-                "message": (
-                    f"Hourly cost ${cost:.4f} exceeds $2.00 threshold — "
-                    "review instance sizing."
-                ),
-                "created_at": now,
-            }
-        )
         triggered = True
 
     # --- NETWORK_ANOMALY ---
@@ -193,7 +201,6 @@ def ingest_metrics(request: Request, payload: MetricPayload):
             "cpu_usage": payload.cpu_usage,
             "ram_usage": payload.ram_usage,
             "network_traffic": payload.network_traffic,
-            "estimated_cost_per_hour": payload.estimated_cost_per_hour,
             "recorded_at": datetime.now(timezone.utc).isoformat(),
         }
     )
@@ -202,7 +209,6 @@ def ingest_metrics(request: Request, payload: MetricPayload):
         server_id,
         payload.cpu_usage,
         payload.ram_usage,
-        payload.estimated_cost_per_hour,
         payload.network_traffic,
     )
 
@@ -212,7 +218,6 @@ def ingest_metrics(request: Request, payload: MetricPayload):
         cpu_usage=row.get("cpu_usage", payload.cpu_usage),
         ram_usage=row.get("ram_usage", payload.ram_usage),
         network_traffic=row.get("network_traffic", payload.network_traffic),
-        estimated_cost_per_hour=row.get("estimated_cost_per_hour", payload.estimated_cost_per_hour),
         recorded_at=row.get("recorded_at", datetime.now(timezone.utc)),
         alert_triggered=alert_triggered,
     )
@@ -231,10 +236,9 @@ def server_status():
     critical_nodes = sum(1 for s in servers if s["status"] == "critical")
     idle_nodes = sum(1 for s in servers if s["status"] == "idle")
 
-    # Latest metrics per server
+    # Latest metrics per server (telemetry only — no cost in this channel)
     metrics_map: dict[str, list[dict]] = {}
     latest_metrics_per_server: list[dict] = []
-    total_cost_hourly = 0.0
     cpu_sum = 0.0
     cpu_count = 0
 
@@ -251,12 +255,33 @@ def server_status():
                     "ram": rows[-1]["ram_usage"],
                 }
             )
-            total_cost_hourly += rows[-1]["estimated_cost_per_hour"]
             cpu_sum += rows[-1]["cpu_usage"]
             cpu_count += 1
 
     avg_cpu = round(cpu_sum / cpu_count, 1) if cpu_count else 0.0
-    monthly_cost_estimate = round(total_cost_hourly * 730, 2)  # ~730 hrs/month
+
+    # --- Real spend from AWS Cost Explorer (daily_costs); zeros otherwise ---
+    cloud = get_cloud_status()
+    costs_map: dict[str, list[dict]] = {}
+    monthly_cost_estimate = 0.0
+    hourly_cost_estimate = 0.0
+
+    if cloud.cost_source == "aws_cost_explorer":
+        daily_rows = get_daily_costs(days=30)
+        for row in daily_rows:
+            costs_map.setdefault(row["server_id"], []).append(row)
+        month_start = datetime.now(timezone.utc).strftime("%Y-%m-01")
+        latest_date = max((r["cost_date"] for r in daily_rows), default=None)
+
+        if daily_rows:
+            monthly_cost_estimate = sum(
+                float(r["amount"]) for r in daily_rows if r["cost_date"] >= month_start
+            )
+            if latest_date:
+                hourly_cost_estimate = (
+                    sum(float(r["amount"]) for r in daily_rows if r["cost_date"] == latest_date)
+                    / 24.0
+                )
 
     summary = {
         "total_nodes": total_nodes,
@@ -265,9 +290,12 @@ def server_status():
         "critical_nodes": critical_nodes,
         "idle_nodes": idle_nodes,
         "avg_cpu_load_pct": avg_cpu,
-        "monthly_cost_estimate": monthly_cost_estimate,
-        "hourly_cost_estimate": round(total_cost_hourly, 4),
+        "monthly_cost_estimate": round(monthly_cost_estimate, 2),
+        "hourly_cost_estimate": round(hourly_cost_estimate, 4),
         "active_alerts_count": len(active_alerts),
+        "cost_source": cloud.cost_source,
+        "cloud_connected": cloud.connected,
+        "last_cost_sync": cloud.last_sync,
     }
 
     return ServerStatusResponse(
@@ -275,7 +303,49 @@ def server_status():
         metrics=metrics_map,
         active_alerts=active_alerts,
         summary=summary,
+        costs=costs_map,
+        cloud=cloud.model_dump(),
     )
+
+
+@app.get("/api/cloud/status", response_model=CloudStatus)
+def cloud_status():
+    """Current AWS Cost Explorer integration state."""
+    return get_cloud_status()
+
+
+@app.post("/api/cloud/sync", response_model=SyncResult)
+def cloud_sync():
+    """Pull real daily costs from AWS Cost Explorer into daily_costs.
+
+    After syncing, raises BUDGET_SPIKE alerts for servers whose latest day
+    exceeds 2× their 14-day mean (real spend, not a heuristic).
+    """
+    if not cloud_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="AWS not configured — set AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY "
+                   "in backend/.env (see backend/.env.example and the README).",
+        )
+    result = sync_daily_costs(days_back=14)
+    if result.error:
+        raise HTTPException(status_code=503, detail=result.error)
+
+    # Real-spend BUDGET_SPIKE detection on the freshly synced daily costs.
+    for s in list_servers():
+        if detect_budget_spikes(s["id"], days=14):
+            insert_alert(
+                {
+                    "server_id": s["id"],
+                    "alert_type": "BUDGET_SPIKE",
+                    "message": (
+                        f"Daily spend for {s.get('server_name', s['id'])} spiked "
+                        "above 2× its 14-day average — review instance sizing."
+                    ),
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+    return result
 
 
 @app.get("/api/alerts")

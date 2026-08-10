@@ -129,6 +129,57 @@ def latest_metrics(server_id: str, limit: int = 10) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Daily costs (real spend, from AWS Cost Explorer)
+# ---------------------------------------------------------------------------
+
+def upsert_daily_cost(server_id: str, cost_date: str, amount: float,
+                      currency: str = "USD", source: str = "aws_cost_explorer") -> None:
+    """Insert or update one daily cost row (unique on server_id + cost_date)."""
+    _supabase.table("daily_costs").upsert(
+        {
+            "server_id": server_id,
+            "cost_date": cost_date,
+            "amount": amount,
+            "currency": currency,
+            "source": source,
+        },
+        on_conflict="server_id,cost_date",
+    ).execute()
+
+
+def get_daily_costs(server_id: str | None = None, days: int = 30) -> list[dict]:
+    """Return daily cost rows, oldest first. Optionally filtered to one server."""
+    query = _supabase.table("daily_costs").select("*")
+    if server_id:
+        query = query.eq("server_id", server_id)
+    rows = query.order("cost_date", desc=True).limit(days).execute().data
+    rows.reverse()  # PostgREST returns newest-first; reorder to chronological
+    return rows
+
+
+def get_daily_cost_totals(days: int = 30) -> list[dict]:
+    """Per-server daily cost aggregates for the last *days* days.
+
+    Returns rows like {server_id, amount, cost_date, currency, source} —
+    the amount is the raw daily value; aggregation happens in the API layer.
+    """
+    return get_daily_costs(server_id=None, days=days)
+
+
+def get_latest_cost_date() -> str | None:
+    """Return the most recent cost_date present in daily_costs (or None)."""
+    rows = (
+        _supabase.table("daily_costs")
+        .select("cost_date")
+        .order("cost_date", desc=True)
+        .limit(1)
+        .execute()
+        .data
+    )
+    return rows[0]["cost_date"] if rows else None
+
+
+# ---------------------------------------------------------------------------
 # Alerts
 # ---------------------------------------------------------------------------
 

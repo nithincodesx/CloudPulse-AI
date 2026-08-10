@@ -32,6 +32,7 @@ export default function ServersPage() {
   const [provisionOpen, setProvisionOpen] = useState(false);
   const [serverName, setServerName] = useState("");
   const [serverIp, setServerIp] = useState("");
+  const [serverCostTag, setServerCostTag] = useState("");
   const [provisioning, setProvisioning] = useState(false);
   const [provisionError, setProvisionError] = useState<string | null>(null);
 
@@ -68,13 +69,15 @@ export default function ServersPage() {
         .insert({
           server_name: serverName.trim(),
           ip_address: serverIp.trim() || null,
+          cost_tag: serverCostTag.trim() || null,
           owner_id: user.id,
         })
-        .select("id, server_name, ip_address, ingestion_token")
+        .select("id, server_name, ip_address, ingestion_token, cost_tag")
         .single();
       if (error) throw error;
       setServerName("");
       setServerIp("");
+      setServerCostTag("");
       setProvisionOpen(false);
       await loadOwnedTokens();
       loadData();
@@ -242,7 +245,7 @@ export default function ServersPage() {
                   <X size={18} className="text-paper/40" />
                 </button>
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-2 flex-wrap">
                 <span className="text-[12px] font-mono bg-white/5 px-2 py-1 rounded text-paper/60 border border-white/5">
                   ID: {selectedServer.id}
                 </span>
@@ -254,6 +257,19 @@ export default function ServersPage() {
                 }`}>
                   {selectedServer.status}
                 </span>
+                {selectedServer.cost_tag && (
+                  <span
+                    className="px-2 py-1 rounded text-[10px] font-mono font-semibold tracking-wider"
+                    style={{
+                      background: "rgba(16,185,129,0.1)",
+                      color: "#10b981",
+                      border: "1px solid rgba(16,185,129,0.2)",
+                    }}
+                    title="AWS Cost Explorer tag this node maps to"
+                  >
+                    tag: {selectedServer.cost_tag}
+                  </span>
+                )}
               </div>
 
               {ownedTokens[selectedServer.id] && (
@@ -432,6 +448,28 @@ export default function ServersPage() {
                       color: "#f4f0e6",
                     }}
                   />
+                </label>
+
+                <label className="flex flex-col gap-1.5">
+                  <span className="font-mono text-[11px] uppercase tracking-widest" style={{ color: "#8a8780" }}>
+                    AWS Cost Tag <span style={{ color: "#5f5d58" }}>(optional)</span>
+                  </span>
+                  <input
+                    type="text"
+                    value={serverCostTag}
+                    onChange={(e) => setServerCostTag(e.target.value)}
+                    placeholder="prod-db-01"
+                    className="rounded-lg border px-3 py-2.5 text-sm outline-none transition-colors"
+                    style={{
+                      background: "#0b0b0d",
+                      borderColor: "rgba(244,240,230,0.10)",
+                      color: "#f4f0e6",
+                    }}
+                  />
+                  <span className="text-[10px] leading-relaxed" style={{ color: "#5f5d58" }}>
+                    Value of the <code className="text-paper/50">server</code> tag on this node&apos;s AWS resources —
+                    used to match Cost Explorer spend.
+                  </span>
                 </label>
 
                 {provisionError && (

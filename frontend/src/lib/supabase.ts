@@ -1,6 +1,6 @@
 import { createBrowserClient } from "@supabase/ssr";
 import type { SupabaseClient } from "@supabase/supabase-js";
-import type { DashboardData, Alert } from "./types";
+import type { DashboardData, Alert, CloudStatus, SyncResult } from "./types";
 
 // Browser Supabase client — powers auth (login/magic link) and owns-server
 // provisioning. Env vars are injected at build time via NEXT_PUBLIC_*.
@@ -44,6 +44,27 @@ export async function resolveAlert(alertId: string): Promise<boolean> {
     console.error("Failed to resolve alert", error);
     return false;
   }
+}
+
+export async function fetchCloudStatus(): Promise<CloudStatus> {
+  const res = await fetch(`${API_URL}/api/cloud/status`);
+  if (!res.ok) throw new Error("Failed to fetch cloud status");
+  return await res.json();
+}
+
+export async function triggerCostSync(): Promise<SyncResult> {
+  const res = await fetch(`${API_URL}/api/cloud/sync`, { method: "POST" });
+  if (!res.ok) {
+    let detail = `Sync failed (${res.status})`;
+    try {
+      const body = await res.json();
+      detail = body.detail ?? detail;
+    } catch {
+      // non-JSON error body
+    }
+    throw new Error(detail);
+  }
+  return await res.json();
 }
 
 export async function updateServerStatus(serverId: string, status: string): Promise<boolean> {

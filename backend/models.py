@@ -16,10 +16,11 @@ from pydantic import BaseModel, Field
 class MetricPayload(BaseModel):
     # NOTE: server_id is intentionally absent — the target server is
     # identified server-side by the ingestion token (Authorization: Bearer).
+    # Cost is also absent — real spend is pulled from AWS Cost Explorer and
+    # stored in daily_costs; the agent never reports fabricated costs.
     cpu_usage: float = Field(..., ge=0.0, le=100.0)
     ram_usage: float = Field(..., ge=0.0, le=100.0)
     network_traffic: float = Field(..., ge=0.0)
-    estimated_cost_per_hour: float = Field(..., ge=0.0)
 
 
 class MetricResponse(BaseModel):
@@ -28,7 +29,6 @@ class MetricResponse(BaseModel):
     cpu_usage: float
     ram_usage: float
     network_traffic: float
-    estimated_cost_per_hour: float
     recorded_at: datetime
     alert_triggered: bool = False
 
@@ -51,6 +51,30 @@ class ServerStatusResponse(BaseModel):
     metrics: dict[str, list[dict]]  # server_id → list of metric rows
     active_alerts: list[dict]
     summary: dict = {}
+    costs: dict[str, list[dict]] = {}  # server_id → daily cost rows (real spend)
+    cloud: dict = {}  # cloud-connection status (see CloudStatus)
+
+
+# ---------------------------------------------------------------------------
+# Cloud cost integration (AWS Cost Explorer)
+# ---------------------------------------------------------------------------
+
+class CloudStatus(BaseModel):
+    connected: bool = False
+    provider: str | None = None
+    cost_tag_key: str = "server"
+    last_sync: str | None = None  # ISO date of the most recent daily cost pulled
+    days_of_data: int = 0
+    cost_source: str = "simulated"  # "aws_cost_explorer" | "simulated"
+    error: str | None = None
+
+
+class SyncResult(BaseModel):
+    days_synced: int = 0
+    matched: int = 0  # resource-tag values mapped to a known server
+    unmatched: list[str] = []  # tag values with no matching server
+    total_amount: float = 0.0
+    error: str | None = None
 
 
 # ---------------------------------------------------------------------------

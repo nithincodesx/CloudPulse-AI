@@ -1,11 +1,13 @@
 "use client";
 
 import { useState } from "react";
+import Link from "next/link";
 import { Server, Cpu, DollarSign, Bell, Cloud, AlertTriangle, TrendingUp } from "lucide-react";
 import KpiCard from "@/components/KpiCard";
 import CpuRamChart from "@/components/CpuRamChart";
 import AlertFeed from "@/components/AlertFeed";
 import ServerTable from "@/components/ServerTable";
+import CostModeBadge from "@/components/CostModeBadge";
 import { useDashboard } from "@/lib/DashboardContext";
 import type { MetricRow } from "@/lib/types";
 
@@ -101,6 +103,32 @@ export default function Dashboard() {
     <>
       <main className="flex-1 space-y-6 p-6 overflow-y-auto">
         {/* ============================================================== */}
+        {/* Simulated cost mode banner (only when no cloud account)         */}
+        {/* ============================================================== */}
+        {!s?.cloud_connected && (
+          <div
+            className="flex items-center gap-3 rounded-2xl px-4 py-3"
+            style={{
+              background: "rgba(255,230,0,0.06)",
+              border: "1px solid rgba(255,230,0,0.18)",
+            }}
+          >
+            <AlertTriangle size={16} style={{ color: "#ffe600", flexShrink: 0 }} />
+            <p className="text-[12px]" style={{ color: "rgba(244,240,230,0.8)" }}>
+              <span className="font-bold" style={{ color: "#ffe600" }}>Simulated cost mode</span>
+              {" — connect an AWS account to see real spend. "}
+              <Link
+                href="/cost-analytics"
+                className="font-semibold underline underline-offset-2"
+                style={{ color: "#ffe600" }}
+              >
+                Connect now
+              </Link>
+            </p>
+          </div>
+        )}
+
+        {/* ============================================================== */}
         {/* KPI Row                                                        */}
         {/* ============================================================== */}
         <section className="grid grid-cols-1 gap-5 sm:grid-cols-2 xl:grid-cols-4">
@@ -127,11 +155,16 @@ export default function Dashboard() {
           />
           <KpiCard
             label="Monthly Spend"
-            value={`$${s?.monthly_cost_estimate?.toLocaleString() ?? 0}`}
-            subtitle="Estimated current month"
+            value={s?.cloud_connected ? `$${(s.monthly_cost_estimate ?? 0).toLocaleString()}` : "$0"}
+            subtitle={s?.cloud_connected ? "Month-to-date · AWS Cost Explorer" : "Connect a cloud account"}
             icon={<DollarSign size={20} />}
-            trend={s && s.hourly_cost_estimate > 0.25 ? "up" : "down"}
-            trendLabel={s ? `$${s.hourly_cost_estimate.toFixed(2)} / hr` : ""}
+            badge={<CostModeBadge connected={!!s?.cloud_connected} />}
+            trend={s && s.cloud_connected && (s.hourly_cost_estimate ?? 0) > 0 ? "up" : "down"}
+            trendLabel={
+              s?.cloud_connected
+                ? `$${(s.hourly_cost_estimate ?? 0).toFixed(2)} / hr (derived from daily)`
+                : "No real spend data"
+            }
           />
           <KpiCard
             label="Active Alerts"

@@ -21,22 +21,41 @@ CREATE TABLE IF NOT EXISTS servers (
   owner_id       UUID REFERENCES auth.users(id),           -- who owns this node
   ingestion_token TEXT NOT NULL DEFAULT encode(gen_random_bytes(32), 'hex')
                    UNIQUE,                                 -- 256-bit bearer token for the agent
+  cost_tag       TEXT,                                     -- AWS resource-tag value this node maps to
   created_at     TIMESTAMPTZ DEFAULT timezone('utc'::text, now()) NOT NULL
 );
 
 -- 2. Server metrics (time-series logs)
+-- NOTE: cost is NOT stored per metric anymore — real spend lives in daily_costs
+-- (populated from AWS Cost Explorer). estimated_cost_per_hour is kept nullable
+-- only for legacy rows written before this change.
 CREATE TABLE IF NOT EXISTS server_metrics (
   id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   server_id               UUID NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
   cpu_usage               FLOAT NOT NULL,
   ram_usage               FLOAT NOT NULL,
   network_traffic         FLOAT NOT NULL,
-  estimated_cost_per_hour FLOAT NOT NULL,
+  estimated_cost_per_hour FLOAT,
   recorded_at             TIMESTAMPTZ DEFAULT timezone('utc'::text, now()) NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_metrics_server_time
   ON server_metrics (server_id, recorded_at DESC);
+
+-- 2b. Daily costs (real spend, per server, from AWS Cost Explorer)
+CREATE TABLE IF NOT EXISTS daily_costs (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  server_id   UUID NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+  cost_date   DATE NOT NULL,
+  amount      NUMERIC(12,4) NOT NULL,
+  currency    TEXT NOT NULL DEFAULT 'USD',
+  source      TEXT NOT NULL DEFAULT 'aws_cost_explorer',
+  created_at  TIMESTAMPTZ DEFAULT timezone('utc'::text, now()) NOT NULL,
+  UNIQUE (server_id, cost_date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_daily_costs_server_date
+  ON daily_costs (server_id, cost_date DESC);
 
 -- 3. System alerts
 CREATE TABLE IF NOT EXISTS system_alerts (
@@ -59,6 +78,13 @@ ALTER TABLE public.servers
 ALTER TABLE public.servers
   ADD COLUMN IF NOT EXISTS ingestion_token TEXT
   NOT NULL DEFAULT encode(gen_random_bytes(32), 'hex') UNIQUE;
+ALTER TABLE public.servers
+  ADD COLUMN IF NOT EXISTS cost_tag TEXT;
+
+-- Cost is no longer written per-metric (real spend lives in daily_costs);
+-- relax the old NOT NULL so legacy rows keep their values but new ones omit it.
+ALTER TABLE public.server_metrics
+  ALTER COLUMN estimated_cost_per_hour DROP NOT NULL;
 
 -- ================================================================
 -- Row Level Security — users only access their own infrastructure.
@@ -68,11 +94,13 @@ ALTER TABLE public.servers
 ALTER TABLE public.servers ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.server_metrics ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.system_alerts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.daily_costs ENABLE ROW LEVEL SECURITY;
 
 -- Drop the old "allow all" policies if present
 DROP POLICY IF EXISTS "Enable all access for all users" ON public.servers;
 DROP POLICY IF EXISTS "Enable all access for all users" ON public.server_metrics;
 DROP POLICY IF EXISTS "Enable all access for all users" ON public.system_alerts;
+DROP POLICY IF EXISTS "Enable all access for all users" ON public.daily_costs;
 
 -- Servers: full control over your own nodes
 CREATE POLICY "users_manage_own_servers" ON public.servers
@@ -100,4 +128,21 @@ CREATE POLICY "users_insert_own_system_alerts" ON public.system_alerts
   FOR INSERT WITH CHECK (
     EXISTS (SELECT 1 FROM public.servers s
             WHERE s.id = system_alerts.server_id AND s.owner_id = auth.uid())
+  );
+
+-- Daily costs: read/write only for costs attached to your servers
+CREATE POLICY "users_read_own_daily_costs" ON public.daily_costs
+  FOR SELECT USING (
+    EXISTS (SELECT 1 FROM public.servers s
+            WHERE s.id = daily_costs.server_id AND s.owner_id = auth.uid())
+  );
+CREATE POLICY "users_insert_own_daily_costs" ON public.daily_costs
+  FOR INSERT WITH CHECK (
+    EXISTS (SELECT 1 FROM public.servers s
+            WHERE s.id = daily_costs.server_id AND s.owner_id = auth.uid())
+  );
+CREATE POLICY "users_delete_own_daily_costs" ON public.daily_costs
+  FOR DELETE USING (
+    EXISTS (SELECT 1 FROM public.servers s
+            WHERE s.id = daily_costs.server_id AND s.owner_id = auth.uid())
   );

@@ -3,6 +3,7 @@ export interface Server {
   server_name: string;
   ip_address?: string;
   ingestion_token?: string;
+  cost_tag?: string;
   status: "active" | "warning" | "critical" | "idle";
   specifications?: {
     vcpus?: number;
@@ -16,8 +17,17 @@ export interface MetricRow {
   cpu_usage: number;
   ram_usage: number;
   network_traffic: number;
-  estimated_cost_per_hour: number;
   recorded_at: string;
+}
+
+/** A daily cost row pulled from AWS Cost Explorer (real spend). */
+export interface DailyCost {
+  id: string;
+  server_id: string;
+  cost_date: string;
+  amount: number;
+  currency: string;
+  source: string;
 }
 
 export interface Alert {
@@ -40,6 +50,28 @@ export interface Summary {
   monthly_cost_estimate: number;
   hourly_cost_estimate: number;
   active_alerts_count: number;
+  /** "aws_cost_explorer" when real data is synced, "simulated" otherwise. */
+  cost_source?: "aws_cost_explorer" | "simulated";
+  cloud_connected?: boolean;
+  last_cost_sync?: string;
+}
+
+export interface CloudStatus {
+  connected: boolean;
+  provider: string | null;
+  cost_tag_key: string;
+  last_sync: string | null;
+  days_of_data: number;
+  cost_source: "aws_cost_explorer" | "simulated";
+  error: string | null;
+}
+
+export interface SyncResult {
+  days_synced: number;
+  matched: number;
+  unmatched: string[];
+  total_amount: number;
+  error: string | null;
 }
 
 export interface DashboardData {
@@ -47,4 +79,7 @@ export interface DashboardData {
   metrics: Record<string, MetricRow[]>;
   active_alerts: Alert[];
   summary: Summary;
+  /** server_id → daily cost rows (real spend) when AWS is connected. */
+  costs?: Record<string, DailyCost[]>;
+  cloud?: CloudStatus;
 }
