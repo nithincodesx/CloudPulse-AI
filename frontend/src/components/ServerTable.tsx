@@ -8,11 +8,18 @@ import {
   Activity,
   Settings,
   PowerOff,
+  Cloud,
+  Disc,
 } from "lucide-react";
 
 interface MetricRow {
   cpu_usage: number;
   ram_usage: number;
+  disk_usage?: number;
+  disk_io?: { read_mb: number; write_mb: number };
+  system_uptime?: number;
+  load_average?: number[];
+  process_count?: number;
 }
 
 interface ServerRow {
@@ -25,6 +32,12 @@ interface ServerRow {
     ram_gb?: number;
     type?: string;
   };
+  source?: "agent" | "aws_discovery";
+  aws_instance_id?: string;
+  aws_region?: string;
+  aws_availability_zone?: string;
+  aws_state?: string;
+  aws_tags?: Record<string, string>;
   latest_metric?: MetricRow;
   /** Real month-to-date cost from AWS Cost Explorer (undefined = simulated mode). */
   monthly_cost?: number;
@@ -110,11 +123,11 @@ export default function ServerTable({ servers, onAction, onRowClick }: ServerTab
         <table className="w-full text-left text-sm">
           <thead>
             <tr style={{ borderBottom: "1px solid rgba(244,240,230,0.06)" }}>
-              {["Node", "Status", "CPU", "RAM", "Cost (MTD)", "Savings", "Action"].map(
+              {["Node", "Source / Info", "Status", "CPU", "RAM", "Disk", "Cost (MTD)", "Savings", "Action"].map(
                 (h, i) => (
                   <th
                     key={h}
-                    className={`px-5 py-4 text-[10px] font-mono font-medium tracking-[0.28em] uppercase ${i === 6 ? "text-right" : ""}`}
+                    className={`px-5 py-4 text-[10px] font-mono font-medium tracking-[0.28em] uppercase ${i === 8 ? "text-right" : ""}`}
                     style={{ color: "rgba(244,240,230,0.35)" }}
                   >
                     {h}
@@ -129,6 +142,7 @@ export default function ServerTable({ servers, onAction, onRowClick }: ServerTab
               const m = s.latest_metric;
               const monthly = s.monthly_cost ?? 0;
               const hasCost = s.monthly_cost != null;
+              const isAWS = s.source === "aws_discovery" || Boolean(s.aws_instance_id);
               const savings =
                 hasCost && (s.status === "idle" || s.status === "warning")
                   ? projectedSavings(monthly)
@@ -154,17 +168,24 @@ export default function ServerTable({ servers, onAction, onRowClick }: ServerTab
                       <div
                         className="flex h-10 w-10 items-center justify-center rounded-xl transition-all"
                         style={{
-                          background: "linear-gradient(180deg, #16161a 0%, #0b0b0d 100%)",
+                          background: isAWS
+                            ? "linear-gradient(180deg, rgba(255,230,0,0.1) 0%, #0b0b0d 100%)"
+                            : "linear-gradient(180deg, #16161a 0%, #0b0b0d 100%)",
                           boxShadow: "inset 0 2px 4px rgba(0,0,0,0.5), 0 2px 4px rgba(255,255,255,0.06)",
+                          border: isAWS ? "1px solid rgba(255,230,0,0.2)" : "1px solid transparent",
                         }}
                       >
-                        <Server
-                          size={16}
-                          className="text-surface-400 group-hover:text-accent-yellow transition-colors"
-                        />
+                        {isAWS ? (
+                          <Cloud size={16} className="text-accent-yellow" />
+                        ) : (
+                          <Server
+                            size={16}
+                            className="text-surface-400 group-hover:text-accent-yellow transition-colors"
+                          />
+                        )}
                       </div>
                       <div>
-                        <p className="font-semibold text-paper tracking-wide text-[13px]">
+                        <p className="font-semibold text-paper tracking-wide text-[13px] flex items-center gap-1.5">
                           {s.server_name}
                         </p>
                         <div className="flex items-center gap-1.5 mt-0.5">
@@ -178,6 +199,44 @@ export default function ServerTable({ servers, onAction, onRowClick }: ServerTab
                         </div>
                       </div>
                     </div>
+                  </td>
+
+                  {/* Source / Info */}
+                  <td className="px-5 py-4">
+                    {isAWS ? (
+                      <div className="space-y-0.5">
+                        <span
+                          className="inline-flex items-center gap-1 rounded-md px-2 py-0.5 text-[9px] font-mono font-semibold uppercase tracking-wider"
+                          style={{
+                            background: "rgba(255,230,0,0.08)",
+                            color: "#ffe600",
+                            border: "1px solid rgba(255,230,0,0.2)",
+                          }}
+                        >
+                          <Cloud size={10} /> AWS EC2
+                        </span>
+                        {s.aws_instance_id && (
+                          <p
+                            className="text-[10px] font-mono tracking-wide truncate max-w-[120px]"
+                            style={{ color: "rgba(244,240,230,0.4)" }}
+                            title={`${s.aws_instance_id} (${s.aws_region || "us-east-1"})`}
+                          >
+                            {s.aws_instance_id}
+                          </p>
+                        )}
+                      </div>
+                    ) : (
+                      <span
+                        className="inline-flex items-center gap-1 rounded-md px-2 py-0.5 text-[9px] font-mono font-semibold uppercase tracking-wider"
+                        style={{
+                          background: "rgba(244,240,230,0.04)",
+                          color: "rgba(244,240,230,0.5)",
+                          border: "1px solid rgba(244,240,230,0.08)",
+                        }}
+                      >
+                        <Server size={10} /> Telemetry Node
+                      </span>
+                    )}
                   </td>
 
                   {/* Status */}
@@ -227,6 +286,19 @@ export default function ServerTable({ servers, onAction, onRowClick }: ServerTab
                     </div>
                   </td>
 
+                  {/* Disk */}
+                  <td className="px-5 py-4">
+                    <div className="flex items-center gap-2">
+                      <Disc size={13} style={{ color: "rgba(244,240,230,0.25)" }} />
+                      <div>
+                        <span className="font-mono text-sm font-bold text-paper">
+                          {m && m.disk_usage != null ? `${m.disk_usage.toFixed(1)}%` : "—"}
+                        </span>
+                        {m && m.disk_usage != null && <MetricBar value={m.disk_usage} color="#38bdf8" />}
+                      </div>
+                    </div>
+                  </td>
+
                   {/* Monthly (real spend) */}
                   <td
                     className="px-5 py-4 font-mono text-sm font-medium"
@@ -255,21 +327,11 @@ export default function ServerTable({ servers, onAction, onRowClick }: ServerTab
                           e.stopPropagation();
                           onAction(s.id, "optimize");
                         }}
-                        className="inline-flex items-center gap-1.5 rounded-xl px-3 py-1.5 text-[11px] font-mono font-semibold tracking-wider uppercase transition-all"
+                        className="inline-flex items-center gap-1.5 rounded-xl px-3 py-1.5 text-[11px] font-mono font-semibold tracking-wider uppercase transition-all cursor-pointer"
                         style={{
                           background: "rgba(244,240,230,0.04)",
                           color: "rgba(244,240,230,0.5)",
                           border: "1px solid rgba(244,240,230,0.08)",
-                        }}
-                        onMouseEnter={(e) => {
-                          e.currentTarget.style.background = "#ffe600";
-                          e.currentTarget.style.color = "#0a0a0b";
-                          e.currentTarget.style.borderColor = "#ffe600";
-                        }}
-                        onMouseLeave={(e) => {
-                          e.currentTarget.style.background = "rgba(244,240,230,0.04)";
-                          e.currentTarget.style.color = "rgba(244,240,230,0.5)";
-                          e.currentTarget.style.borderColor = "rgba(244,240,230,0.08)";
                         }}
                       >
                         <Settings size={13} /> Optimize
@@ -281,21 +343,11 @@ export default function ServerTable({ servers, onAction, onRowClick }: ServerTab
                           e.stopPropagation();
                           onAction(s.id, "terminate");
                         }}
-                        className="inline-flex items-center gap-1.5 rounded-xl px-3 py-1.5 text-[11px] font-mono font-semibold tracking-wider uppercase transition-all"
+                        className="inline-flex items-center gap-1.5 rounded-xl px-3 py-1.5 text-[11px] font-mono font-semibold tracking-wider uppercase transition-all cursor-pointer"
                         style={{
                           background: "rgba(244,240,230,0.04)",
                           color: "rgba(244,240,230,0.5)",
                           border: "1px solid rgba(244,240,230,0.08)",
-                        }}
-                        onMouseEnter={(e) => {
-                          e.currentTarget.style.background = "#e8462c";
-                          e.currentTarget.style.color = "#fafaf7";
-                          e.currentTarget.style.borderColor = "#e8462c";
-                        }}
-                        onMouseLeave={(e) => {
-                          e.currentTarget.style.background = "rgba(244,240,230,0.04)";
-                          e.currentTarget.style.color = "rgba(244,240,230,0.5)";
-                          e.currentTarget.style.borderColor = "rgba(244,240,230,0.08)";
                         }}
                       >
                         <PowerOff size={13} /> Terminate

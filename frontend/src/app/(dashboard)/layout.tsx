@@ -1,40 +1,24 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { useRouter } from "next/navigation";
-import { Loader2 } from "lucide-react";
+import { useState } from "react";
 import Sidebar from "@/components/Sidebar";
 import Topbar from "@/components/Topbar";
 import { DashboardProvider } from "@/lib/DashboardContext";
-import { useAuth } from "@/lib/AuthContext";
 
 export default function DashboardLayout({ children }: { children: React.ReactNode }) {
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const { session, isLoading } = useAuth();
-  const router = useRouter();
-
-  // Client-side auth guard: unauthenticated visitors are bounced to /login.
-  useEffect(() => {
-    if (!isLoading && !session) router.replace("/login");
-  }, [isLoading, session, router]);
-
-  if (isLoading || !session) {
-    return (
-      <div className="flex min-h-screen items-center justify-center" style={{ background: "#0b0b0d" }}>
-        <Loader2 size={24} className="animate-spin" style={{ color: "#ffe600" }} />
-      </div>
-    );
-  }
 
   return (
     <DashboardProvider>
-      <div className="flex min-h-screen dashboard-bg">
+      <div className="flex min-h-screen bg-[#07070a] dashboard-bg text-[#f4f0e6]">
         <Sidebar sidebarOpen={sidebarOpen} setSidebarOpen={setSidebarOpen} />
 
         {/* Main content container */}
         <div className="flex flex-1 flex-col min-w-0 overflow-hidden relative">
           <Topbar setSidebarOpen={setSidebarOpen} />
-          {children}
+          <main className="flex-1 overflow-y-auto px-4 md:px-8 py-6">
+            {children}
+          </main>
         </div>
       </div>
     </DashboardProvider>

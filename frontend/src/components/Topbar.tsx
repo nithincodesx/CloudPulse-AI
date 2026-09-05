@@ -1,10 +1,13 @@
 "use client";
 
-import React from "react";
-import { Menu, RefreshCw, Bell, LogOut } from "lucide-react";
+import React, { useState } from "react";
+import { Menu, RefreshCw, Bell, LogOut, Cloud } from "lucide-react";
 import { useDashboard } from "@/lib/DashboardContext";
 import { usePathname, useRouter } from "next/navigation";
 import { useAuth } from "@/lib/AuthContext";
+import { triggerResourceDiscovery } from "@/lib/supabase";
+import AWSAccountSelector from "./AWSAccountSelector";
+import OrgSwitcher from "./OrgSwitcher";
 
 interface TopbarProps {
   setSidebarOpen: (val: boolean) => void;
@@ -14,14 +17,29 @@ function cn(...classes: (string | boolean | undefined)[]) {
   return classes.filter(Boolean).join(" ");
 }
 
-
-
 export default function Topbar({ setSidebarOpen }: TopbarProps) {
   const { data, loading, isLive, setIsLive, alertFeedOpen, setAlertFeedOpen, loadData } = useDashboard();
   const { user, signOut } = useAuth();
   const router = useRouter();
   const pathname = usePathname();
   const summary = data?.summary;
+  const [discovering, setDiscovering] = useState(false);
+  const [discMsg, setDiscMsg] = useState<string | null>(null);
+
+  const handleDiscover = async () => {
+    setDiscovering(true);
+    setDiscMsg(null);
+    try {
+      const res = await triggerResourceDiscovery();
+      setDiscMsg(`Discovered ${res.discovered_count} EC2 instances`);
+      await loadData();
+    } catch (err: any) {
+      setDiscMsg(err.message || "Discovery failed");
+    } finally {
+      setDiscovering(false);
+      setTimeout(() => setDiscMsg(null), 4000);
+    }
+  };
 
   const handleSignOut = async () => {
     await signOut();
@@ -33,10 +51,12 @@ export default function Topbar({ setSidebarOpen }: TopbarProps) {
     title = "Fleet Management";
   } else if (pathname === "/cost-analytics") {
     title = "Cost Analytics";
-  } else if (pathname === "/alerts") {
-    title = "Incident Command";
-  } else if (pathname === "/resources") {
-    title = "Hardware Topology";
+  } else if (pathname === "/incidents") {
+    title = "Incident Center";
+  } else if (pathname === "/alert-rules") {
+    title = "Alert Rules & Channels";
+  } else if (pathname === "/optimization") {
+    title = "Cost Optimization";
   }
 
   const nodesCount = summary?.total_nodes ?? 1;
@@ -73,6 +93,16 @@ export default function Topbar({ setSidebarOpen }: TopbarProps) {
 
         {/* Right Group (Controls) */}
         <div className="flex items-center gap-3">
+            {/* Multi-Tenant Organization Switcher */}
+            <OrgSwitcher />
+
+            {/* Multi-Tenant AWS Account Selector */}
+            <AWSAccountSelector
+              onAccountChanged={() => {
+                loadData();
+              }}
+            />
+
             {/* Status Indicator (Pill) */}
             <button
               onClick={() => setIsLive(!isLive)}

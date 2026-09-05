@@ -26,21 +26,40 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [isLoading, setIsLoading] = useState(true);
 
   useEffect(() => {
-    supabase.auth.getSession().then(({ data }) => {
-      setSession(data.session);
-      setUser(data.session?.user ?? null);
-      setIsLoading(false);
-    });
+    let mounted = true;
+
+    // Safety timeout: Ensure loading never hangs if Supabase auth is slow or unreachable
+    const timeout = setTimeout(() => {
+      if (mounted) setIsLoading(false);
+    }, 1500);
+
+    supabase.auth
+      .getSession()
+      .then(({ data }) => {
+        if (!mounted) return;
+        setSession(data.session);
+        setUser(data.session?.user ?? null);
+        setIsLoading(false);
+      })
+      .catch((err) => {
+        console.warn("Could not retrieve Supabase session:", err);
+        if (mounted) setIsLoading(false);
+      });
 
     const {
       data: { subscription },
     } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+      if (!mounted) return;
       setSession(nextSession);
       setUser(nextSession?.user ?? null);
       setIsLoading(false);
     });
 
-    return () => subscription.unsubscribe();
+    return () => {
+      mounted = false;
+      clearTimeout(timeout);
+      subscription.unsubscribe();
+    };
   }, []);
 
   const signInWithPassword = useCallback(async (email: string, password: string) => {

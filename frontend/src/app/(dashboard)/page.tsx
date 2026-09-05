@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import Link from "next/link";
 import { Server, Cpu, DollarSign, Bell, Cloud, AlertTriangle, TrendingUp } from "lucide-react";
 import KpiCard from "@/components/KpiCard";
@@ -8,8 +8,10 @@ import CpuRamChart from "@/components/CpuRamChart";
 import AlertFeed from "@/components/AlertFeed";
 import ServerTable from "@/components/ServerTable";
 import CostModeBadge from "@/components/CostModeBadge";
+import OnboardingGuide from "@/components/OnboardingGuide";
 import { useDashboard } from "@/lib/DashboardContext";
-import type { MetricRow } from "@/lib/types";
+import { fetchAWSConnections } from "@/lib/supabase";
+import type { MetricRow, AWSConnection } from "@/lib/types";
 
 /** Transform server metrics into chart-friendly shape. */
 function toChartPoints(metrics: MetricRow[]) {
@@ -25,8 +27,13 @@ function toChartPoints(metrics: MetricRow[]) {
 }
 
 export default function Dashboard() {
-  const { data, loading, isLive, alertFeedOpen, handleDismissAlert, handleServerAction } = useDashboard();
+  const { data, loading, isLive, alertFeedOpen, handleDismissAlert, handleServerAction, loadData } = useDashboard();
   const [selectedServer, setSelectedServer] = useState<string | null>(null);
+  const [connections, setConnections] = useState<AWSConnection[]>([]);
+
+  useEffect(() => {
+    fetchAWSConnections().then(setConnections).catch(() => {});
+  }, []);
 
   // --- Loading skeleton ------------------------------------------------
   if (loading && !data) {
@@ -102,31 +109,15 @@ export default function Dashboard() {
   return (
     <>
       <main className="flex-1 space-y-6 p-6 overflow-y-auto">
-        {/* ============================================================== */}
-        {/* Simulated cost mode banner (only when no cloud account)         */}
-        {/* ============================================================== */}
-        {!s?.cloud_connected && (
-          <div
-            className="flex items-center gap-3 rounded-2xl px-4 py-3"
-            style={{
-              background: "rgba(255,230,0,0.06)",
-              border: "1px solid rgba(255,230,0,0.18)",
-            }}
-          >
-            <AlertTriangle size={16} style={{ color: "#ffe600", flexShrink: 0 }} />
-            <p className="text-[12px]" style={{ color: "rgba(244,240,230,0.8)" }}>
-              <span className="font-bold" style={{ color: "#ffe600" }}>Simulated cost mode</span>
-              {" — connect an AWS account to see real spend. "}
-              <Link
-                href="/cost-analytics"
-                className="font-semibold underline underline-offset-2"
-                style={{ color: "#ffe600" }}
-              >
-                Connect now
-              </Link>
-            </p>
-          </div>
-        )}
+        {/* Onboarding Guide Stepper */}
+        <OnboardingGuide
+          connections={connections}
+          serverCount={data?.servers.length ?? 0}
+          onRefresh={async () => {
+            await loadData();
+            fetchAWSConnections().then(setConnections).catch(() => {});
+          }}
+        />
 
         {/* ============================================================== */}
         {/* KPI Row                                                        */}

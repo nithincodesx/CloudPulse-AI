@@ -16,6 +16,8 @@ import {
   ShieldCheck,
   TrendingDown,
   Layers,
+  Flame,
+  Sliders,
 } from "lucide-react";
 
 function TopoLogo() {
@@ -108,6 +110,13 @@ export default function Sidebar({ sidebarOpen, setSidebarOpen }: SidebarProps) {
       value: "cost",
       links: [
         {
+          label: "Cost Optimization",
+          href: "/optimization",
+          icon: <Sparkles size={13} className="text-amber-400" />,
+          badge: "Optimizer",
+          description: "Rule-based waste, idle & right-sizing engine",
+        },
+        {
           label: "Cost Analytics",
           href: "/cost-analytics",
           icon: <TrendingDown size={13} />,
@@ -122,22 +131,48 @@ export default function Sidebar({ sidebarOpen, setSidebarOpen }: SidebarProps) {
       ],
     },
     {
-      title: "Monitoring",
+      title: "Monitoring & Incident Center",
       icon: <Bell size={16} />,
       value: "monitoring",
       links: [
         {
-          label: "Active Alerts",
-          href: "/", // Main alert feed in landing dashboard page
-          icon: <Zap size={13} />,
-          badge: "Live",
-          description: "High CPU & network exception stream",
+          label: "Incident Center",
+          href: "/incidents",
+          icon: <Flame size={13} className="text-amber-400" />,
+          badge: "New",
+          description: "Incident lifecycle & grounded AI investigation",
         },
         {
-          label: "Resource Spikes",
+          label: "Alert Rules & Channels",
+          href: "/alert-rules",
+          icon: <Sliders size={13} />,
+          description: "Rule thresholds, webhooks & notification audit logs",
+        },
+        {
+          label: "Live Telemetry Feed",
           href: "/",
-          icon: <BarChart3 size={13} />,
-          description: "Time-series resource charts",
+          icon: <Zap size={13} />,
+          badge: "Live",
+        },
+      ],
+    },
+    {
+      title: "Tenant & Security",
+      icon: <ShieldCheck size={16} />,
+      value: "settings" as any,
+      links: [
+        {
+          label: "Workspace & RBAC",
+          href: "/settings/workspace",
+          icon: <Sliders size={13} />,
+          description: "Tenant profile, member roles & usage limits",
+        },
+        {
+          label: "Audit Trail",
+          href: "/settings/audit-logs",
+          icon: <ShieldCheck size={13} />,
+          badge: "Compliance",
+          description: "Immutable security & operation audit logs",
         },
       ],
     },

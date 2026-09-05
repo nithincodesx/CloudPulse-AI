@@ -26,9 +26,14 @@ export function DashboardProvider({ children }: { children: React.ReactNode }) {
 
   const loadData = useCallback(async () => {
     if (!isLive && data) return;
-    const result = await fetchDashboardData();
-    setData(result);
-    setLoading(false);
+    try {
+      const result = await fetchDashboardData();
+      setData(result);
+    } catch (err) {
+      console.warn("Could not connect to backend server (http://localhost:8000):", err);
+    } finally {
+      setLoading(false);
+    }
   }, [isLive, data]);
 
   useEffect(() => {
@@ -50,7 +55,11 @@ export function DashboardProvider({ children }: { children: React.ReactNode }) {
           }
         : prev
     );
-    await resolveAlert(alertId);
+    try {
+      await resolveAlert(alertId);
+    } catch (err) {
+      console.error("Failed to dismiss alert on backend:", err);
+    }
     loadData();
   };
 
@@ -63,7 +72,11 @@ export function DashboardProvider({ children }: { children: React.ReactNode }) {
         servers: prev.servers.map((s) => (s.id === serverId ? { ...s, status: newStatus } : s)),
       };
     });
-    await updateServerStatus(serverId, newStatus);
+    try {
+      await updateServerStatus(serverId, newStatus);
+    } catch (err) {
+      console.error("Failed to update server status on backend:", err);
+    }
     loadData();
   };
 

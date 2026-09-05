@@ -9,7 +9,17 @@ export interface Server {
     vcpus?: number;
     ram_gb?: number;
     type?: string;
+    architecture?: string;
+    hypervisor?: string;
   };
+  source?: "agent" | "aws_discovery";
+  aws_instance_id?: string;
+  aws_region?: string;
+  aws_availability_zone?: string;
+  aws_state?: string;
+  aws_launch_time?: string;
+  aws_tags?: Record<string, string>;
+  last_discovered_at?: string;
   created_at?: string;
 }
 
@@ -17,6 +27,12 @@ export interface MetricRow {
   cpu_usage: number;
   ram_usage: number;
   network_traffic: number;
+  disk_usage?: number;
+  disk_io?: { read_mb: number; write_mb: number };
+  system_uptime?: number;
+  load_average?: number[];
+  process_count?: number;
+  network_stats?: { packets_sent: number; packets_recv: number; errin?: number; errout?: number };
   recorded_at: string;
 }
 
@@ -46,6 +62,8 @@ export interface Summary {
   warning_nodes: number;
   critical_nodes: number;
   idle_nodes: number;
+  aws_discovered_nodes?: number;
+  agent_nodes?: number;
   avg_cpu_load_pct: number;
   monthly_cost_estimate: number;
   hourly_cost_estimate: number;
@@ -60,7 +78,10 @@ export interface CloudStatus {
   connected: boolean;
   provider: string | null;
   cost_tag_key: string;
+  region?: string;
   last_sync: string | null;
+  last_discovery?: string | null;
+  discovered_count?: number;
   days_of_data: number;
   cost_source: "aws_cost_explorer" | "simulated";
   error: string | null;
@@ -71,6 +92,16 @@ export interface SyncResult {
   matched: number;
   unmatched: string[];
   total_amount: number;
+  error: string | null;
+}
+
+export interface DiscoveryResult {
+  discovered_count: number;
+  created_count: number;
+  updated_count: number;
+  matched_count: number;
+  instances: Record<string, unknown>[];
+  region: string;
   error: string | null;
 }
 
@@ -106,3 +137,341 @@ export interface DashboardData {
   costs?: Record<string, DailyCost[]>;
   cloud?: CloudStatus;
 }
+
+// ---------------------------------------------------------------------------
+// Phase 2: Advanced Anomaly & Cost Optimization Types
+// ---------------------------------------------------------------------------
+
+export interface AnomalyEvent {
+  id: string;
+  server_id: string;
+  metric_name: string;
+  current_value: number;
+  baseline_value: number;
+  deviation_sigma?: number | null;
+  severity: "info" | "warning" | "critical";
+  consecutive_count: number;
+  duration_seconds: number;
+  detection_method: string;
+  explanation: string;
+  meta?: Record<string, any>;
+  resolved: boolean;
+  servers?: { server_name: string } | null;
+  created_at?: string;
+}
+
+export interface OptimizationRecommendation {
+  id: string;
+  server_id: string;
+  service_name: string;
+  resource_id?: string | null;
+  resource_name: string;
+  region?: string | null;
+  recommendation_type: "IDLE_RESOURCE" | "LOW_UTILIZATION" | "RIGHT_SIZING" | "COST_SPIKE" | "UNATTACHED_WASTE";
+  severity: "info" | "warning" | "critical";
+  current_cost_monthly: number;
+  estimated_savings_monthly: number;
+  estimated_avoidable_cost: number;
+  confidence: "HIGH" | "MEDIUM" | "LOW";
+  pricing_source: string;
+  problem_summary: string;
+  action_recommendation: string;
+  target_resource_type?: string | null;
+  evidence: {
+    avg_cpu?: number;
+    peak_cpu?: number;
+    avg_ram?: number;
+    peak_ram?: number;
+    sample_count?: number;
+    current_instance_type?: string;
+    target_instance_type?: string;
+    current_monthly_rate?: number;
+    target_monthly_rate?: number;
+    latest_daily_amount?: number;
+    historical_daily_avg?: number;
+    spike_factor?: number;
+    waste_reasons?: string[];
+    [key: string]: any;
+  };
+  status: "active" | "applied" | "dismissed";
+  servers?: { server_name: string } | null;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface OptimizationSummary {
+  total_monthly_spend: number;
+  estimated_avoidable_spend: number;
+  potential_monthly_savings: number;
+  total_opportunities_count: number;
+  highest_cost_resources: Array<{
+    server_id: string;
+    resource_name: string;
+    instance_type: string;
+    monthly_cost: number;
+    region: string;
+    source: string;
+  }>;
+  highest_savings_opportunities: Array<{
+    server_id: string;
+    resource_name: string;
+    recommendation_type: string;
+    severity: string;
+    monthly_savings: number;
+    action: string;
+    confidence: string;
+  }>;
+  by_type_counts: Record<string, number>;
+  by_severity_counts: Record<string, number>;
+}
+
+export interface BaselineEnvelope {
+  rolling: { mean: number; std: number | null; sample_count: number; bucket_label: string } | null;
+  time_aware: { mean: number; std: number | null; sample_count: number; bucket_label: string } | null;
+  current_expected_mean: number | null;
+  current_expected_std: number | null;
+}
+
+export interface ServerBaselineInfo {
+  server_id: string;
+  server_name: string;
+  sample_count: number;
+  baselines: {
+    cpu: BaselineEnvelope;
+    ram: BaselineEnvelope;
+    network: BaselineEnvelope;
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: Smart Alerting, Incidents & Grounded AI Types
+// ---------------------------------------------------------------------------
+
+export interface NotificationChannel {
+  id: string;
+  name: string;
+  channel_type: "webhook" | "discord" | "slack" | "email";
+  config: {
+    url?: string;
+    secret?: string;
+    email?: string;
+    [key: string]: any;
+  };
+  enabled: boolean;
+  created_at?: string;
+}
+
+export interface AlertRule {
+  id: string;
+  name: string;
+  rule_type: "CPU_ANOMALY" | "RAM_ANOMALY" | "NETWORK_ANOMALY" | "IDLE_RESOURCE" | "BUDGET_SPIKE" | "SAVINGS_THRESHOLD" | "CUSTOM";
+  condition_config: {
+    threshold?: number;
+    savings_min?: number;
+    sigma_min?: number;
+    consecutive_samples?: number;
+    [key: string]: any;
+  };
+  severity: "info" | "warning" | "critical";
+  cooldown_minutes: number;
+  channels: string[];
+  enabled: boolean;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface NotificationLog {
+  id: string;
+  rule_id?: string | null;
+  incident_id?: string | null;
+  server_id?: string | null;
+  channel_type: string;
+  severity: string;
+  recipient_target?: string | null;
+  status: "sent" | "failed" | "cooldown_skipped";
+  payload: Record<string, any>;
+  error_message?: string | null;
+  created_at?: string;
+}
+
+export interface IncidentTimeline {
+  id: string;
+  incident_id: string;
+  event_type: string;
+  actor: string;
+  message: string;
+  meta: Record<string, any>;
+  created_at: string;
+}
+
+export interface IncidentNote {
+  id: string;
+  incident_id: string;
+  author_name: string;
+  note_text: string;
+  created_at: string;
+}
+
+export interface ActionStep {
+  priority: "Critical" | "High" | "Medium" | "Low";
+  action: string;
+  target_resource: string;
+  rationale: string;
+}
+
+export interface AIInvestigation {
+  summary: string;
+  incident_explanation: string;
+  cost_impact_explanation: string;
+  root_cause_hypotheses: string[];
+  prioritized_actions: ActionStep[];
+  grounded_facts: Record<string, any>;
+  provider?: string | null;
+  model?: string | null;
+  is_fallback: boolean;
+}
+
+export interface Incident {
+  id: string;
+  server_id: string;
+  title: string;
+  description: string;
+  incident_type: string;
+  severity: "info" | "warning" | "critical";
+  status: "open" | "acknowledged" | "resolved";
+  root_cause_summary?: string | null;
+  ai_investigation?: AIInvestigation | null;
+  acknowledged_at?: string | null;
+  acknowledged_by?: string | null;
+  resolved_at?: string | null;
+  resolved_by?: string | null;
+  servers?: { server_name: string } | null;
+  server_details?: {
+    server_name?: string;
+    specifications?: Record<string, any>;
+    aws_region?: string;
+    aws_instance_id?: string;
+  } | null;
+  timeline?: IncidentTimeline[];
+  notes?: IncidentNote[];
+  created_at?: string;
+  updated_at?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: Multi-Tenant SaaS AWS Connection Types
+// ---------------------------------------------------------------------------
+
+export interface AWSConnection {
+  id: string;
+  user_id?: string | null;
+  organization_id?: string | null;
+  aws_account_id?: string | null;
+  role_arn?: string | null;
+  external_id: string;
+  region: string;
+  display_name: string;
+  status: "pending" | "connected" | "error" | "disconnected";
+  health_status?: "HEALTHY" | "DEGRADED" | "ERROR" | "UNVERIFIED";
+  health_checks?: Record<string, any>;
+  error_message?: string | null;
+  last_verified_at?: string | null;
+  last_sync_at?: string | null;
+  last_sync_started?: string | null;
+  last_sync_completed?: string | null;
+  sync_status?: "IDLE" | "SYNCING" | "SUCCESS" | "FAILED";
+  sync_error?: string | null;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface AWSConnectionInitiateResult {
+  external_id: string;
+  cloudpulse_account_id: string;
+  trust_policy: Record<string, any>;
+  permissions_policy: Record<string, any>;
+  cloudformation_quick_create_url: string;
+  region: string;
+}
+
+export interface AWSConnectionVerifyResult {
+  success: boolean;
+  status: "pending" | "connected" | "error" | "disconnected";
+  aws_account_id?: string | null;
+  error_message?: string | null;
+  connection?: AWSConnection | null;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5: Multi-Tenant Organizations, RBAC, Audit Logs & Health Diagnostics
+// ---------------------------------------------------------------------------
+
+export type OrgRole = "OWNER" | "ADMIN" | "MEMBER" | "VIEWER";
+
+export interface Organization {
+  id: string;
+  name: string;
+  slug: string;
+  plan_tier: "free" | "starter" | "pro" | "enterprise";
+  max_aws_connections: number;
+  retention_days: number;
+  user_role?: OrgRole | null;
+  members_count?: number;
+  aws_connections_count?: number;
+  servers_count?: number;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface OrganizationMember {
+  id: string;
+  organization_id: string;
+  user_id: string;
+  role: OrgRole;
+  invited_email?: string | null;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface AuditLog {
+  id: string;
+  organization_id: string;
+  actor_id?: string | null;
+  actor_email?: string | null;
+  action: string;
+  resource_type: string;
+  resource_id?: string | null;
+  metadata: Record<string, any>;
+  created_at: string;
+}
+
+export interface AWSHealthCheckItem {
+  status: "PASS" | "FAIL" | "SKIPPED";
+  message?: string | null;
+  latency_ms?: number | null;
+  error?: string | null;
+}
+
+export interface AWSHealthDiagnosticResult {
+  connection_id: string;
+  health_status: "HEALTHY" | "DEGRADED" | "ERROR" | "UNVERIFIED";
+  checks: Record<string, AWSHealthCheckItem>;
+  diagnosed_at: string;
+  summary: string;
+}
+
+export interface OrganizationUsage {
+  organization_id: string;
+  plan_tier: string;
+  connected_aws_accounts: number;
+  max_aws_connections: number;
+  monitored_nodes: number;
+  active_alerts: number;
+  retention_days: number;
+  telemetry_metrics_24h: number;
+  telemetry_metrics_30d: number;
+}
+
+
+
+
