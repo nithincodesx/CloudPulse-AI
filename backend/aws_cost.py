@@ -1,17 +1,8 @@
 """AWS Cost Explorer integration for CloudPulse AI.
 
 Read-only: pulls *actual* daily cost per resource tag into the ``daily_costs``
-table. Credentials come from ``backend/.env`` (single connected account) and
-never touch the database or frontend.
-
-When AWS is not configured, the dashboard reports simulated mode ($0 / connect
-prompt) — this module never fabricates cost numbers.
-
-Env vars (all optional; absent ⇒ simulated mode):
-    AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY  — IAM user/role creds (see README)
-    AWS_REGION                                 — default us-east-1
-    AWS_COST_TAG_KEY                           — resource-tag key to group by,
-                                                 default "server"
+table. Supports Multi-Tenant cross-account AssumeRole connections as well as
+local developer .env fallback.
 """
 
 from __future__ import annotations
@@ -22,6 +13,7 @@ from typing import Any, Optional
 
 from dotenv import load_dotenv
 
+from aws_credentials import get_aws_client
 from database import (
     get_daily_costs,
     get_latest_cost_date,
@@ -34,36 +26,34 @@ load_dotenv()
 
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "").strip()
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "").strip()
-AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1").strip()
 AWS_COST_TAG_KEY = os.getenv("AWS_COST_TAG_KEY", "server").strip()
 
 try:
-    import boto3  # noqa: E402
+    import boto3
     from botocore.exceptions import BotoCoreError, ClientError
     _BOTO3_AVAILABLE = True
-except ImportError:  # pragma: no cover - only when boto3 isn't installed
+except ImportError:  # pragma: no cover
     boto3 = None
     _BOTO3_AVAILABLE = False
 
 
-def cloud_configured() -> bool:
-    """True when AWS credentials are present and boto3 is installed."""
-    return _BOTO3_AVAILABLE and bool(AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY)
+def cloud_configured(connection: Optional[dict[str, Any]] = None) -> bool:
+    """True when an active AWS connection or developer credentials are present and boto3 is installed."""
+    if not _BOTO3_AVAILABLE:
+        return False
+    if connection and connection.get("role_arn") and connection.get("external_id"):
+        return True
+    return bool(AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY)
 
 
-def get_ce_client():
+def get_ce_client(connection: Optional[dict[str, Any]] = None, region: Optional[str] = None):
     """Return a boto3 Cost Explorer client, or raise a clear RuntimeError."""
-    if not cloud_configured():
+    if not cloud_configured(connection):
         raise RuntimeError(
-            "AWS not configured. Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY "
-            "in backend/.env (see backend/.env.example and the README) then restart."
+            "AWS not configured. Connect an AWS Account in Dashboard or set AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY in backend/.env."
         )
-    return boto3.client(
-        "ce",
-        region_name=AWS_REGION,
-        aws_access_key_id=AWS_ACCESS_KEY_ID,
-        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-    )
+    return get_aws_client("ce", connection=connection, region=region or AWS_REGION)
 
 
 # ---------------------------------------------------------------------------
@@ -79,12 +69,12 @@ def _time_period(days_back: int) -> dict:
     }
 
 
-def fetch_daily_costs(days_back: int = 14) -> list[dict]:
+def fetch_daily_costs(days_back: int = 14, connection: Optional[dict[str, Any]] = None) -> list[dict]:
     """Pull daily UnblendedCost per resource-tag value.
 
     Returns [{tag_value, date, amount}] — actual AWS spend, never fabricated.
     """
-    ce = get_ce_client()
+    ce = get_ce_client(connection=connection)
     resp = ce.get_cost_and_usage(
         TimePeriod=_time_period(days_back),
         Granularity="DAILY",
@@ -107,12 +97,12 @@ def fetch_daily_costs(days_back: int = 14) -> list[dict]:
     return rows
 
 
-def fetch_service_breakdown(days_back: int = 14) -> list[dict]:
+def fetch_service_breakdown(days_back: int = 14, connection: Optional[dict[str, Any]] = None) -> list[dict]:
     """Pull daily UnblendedCost grouped by AWS service.
 
     Returns [{service, date, amount}] — used for the stacked cost chart.
     """
-    ce = get_ce_client()
+    ce = get_ce_client(connection=connection)
     resp = ce.get_cost_and_usage(
         TimePeriod=_time_period(days_back),
         Granularity="DAILY",
@@ -149,13 +139,19 @@ def _match_server(servers: list[dict], tag_value: str) -> Optional[dict]:
     return None
 
 
-def sync_daily_costs(days_back: int = 14) -> SyncResult:
+def sync_daily_costs(
+    days_back: int = 14,
+    connection: Optional[dict[str, Any]] = None,
+) -> SyncResult:
     """Pull daily costs from Cost Explorer and upsert them into daily_costs."""
-    if not cloud_configured():
-        return SyncResult(error="AWS not configured — set AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY in backend/.env")
+    if not cloud_configured(connection):
+        return SyncResult(error="AWS not configured — Connect an AWS account in the dashboard.")
 
     servers = list_servers()
-    rows = fetch_daily_costs(days_back=days_back)
+    try:
+        rows = fetch_daily_costs(days_back=days_back, connection=connection)
+    except Exception as exc:  # noqa: BLE001
+        return SyncResult(error=f"Cost Explorer error: {exc}")
 
     matched = 0
     unmatched: set[str] = set()
@@ -186,23 +182,23 @@ def sync_daily_costs(days_back: int = 14) -> SyncResult:
     )
 
 
-def get_cloud_status() -> CloudStatus:
+def get_cloud_status(connection: Optional[dict[str, Any]] = None) -> CloudStatus:
     """Describe the current cost integration state (never raises on unconfigured)."""
     if not _BOTO3_AVAILABLE:
         return CloudStatus(error="boto3 is not installed — run pip install -r requirements.txt")
 
-    if not cloud_configured():
+    if not cloud_configured(connection):
         return CloudStatus(
             connected=False,
             cost_tag_key=AWS_COST_TAG_KEY,
             cost_source="simulated",
-            error="AWS not configured — set AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY in backend/.env",
+            error="AWS not configured — Connect an AWS account in the dashboard.",
         )
 
     # Probe connectivity once to surface a real error in the UI.
     error: str | None = None
     try:
-        get_ce_client()
+        get_ce_client(connection=connection)
     except Exception as exc:  # noqa: BLE001 - surface any credential/region error
         error = str(exc)
 
@@ -221,11 +217,7 @@ def get_cloud_status() -> CloudStatus:
 
 
 def detect_budget_spikes(server_id: str, days: int = 14, threshold_mult: float = 2.0) -> bool:
-    """True when a server's latest daily cost is > threshold_mult × its mean.
-
-    Runs against the *real* daily_costs data — the honest replacement for the
-    old per-metric BUDGET_SPIKE heuristic.
-    """
+    """True when a server's latest daily cost is > threshold_mult × its mean."""
     rows = get_daily_costs(server_id=server_id, days=days)
     if len(rows) < 2:
         return False
