@@ -26,19 +26,68 @@ def collect_metrics() -> dict:
     """Return a snapshot of current host metrics.
 
     Cost is intentionally NOT reported here — real spend is pulled from
-    AWS Cost Explorer by the backend and stored in daily_costs. Fabricating a
-    per-metric cost would present fake numbers as real.
+    AWS Cost Explorer by the backend and stored in daily_costs.
     """
     cpu = psutil.cpu_percent(interval=0.5)
     ram = psutil.virtual_memory().percent
     net = psutil.net_io_counters()
     network_mb = (net.bytes_sent + net.bytes_recv) / (1024 * 1024)
 
-    return {
+    metrics = {
         "cpu_usage": round(cpu, 1),
         "ram_usage": round(ram, 1),
         "network_traffic": round(network_mb, 2),
     }
+
+    # Extended metrics (safe collection across platforms)
+    try:
+        metrics["disk_usage"] = round(psutil.disk_usage("/").percent, 1)
+    except Exception:
+        try:
+            # Fallback for Windows root
+            metrics["disk_usage"] = round(psutil.disk_usage("C:\\").percent, 1)
+        except Exception:
+            pass
+
+    try:
+        disk_io = psutil.disk_io_counters()
+        if disk_io:
+            metrics["disk_io"] = {
+                "read_mb": round(disk_io.read_bytes / (1024 * 1024), 2),
+                "write_mb": round(disk_io.write_bytes / (1024 * 1024), 2),
+            }
+    except Exception:
+        pass
+
+    try:
+        metrics["system_uptime"] = round(time.time() - psutil.boot_time(), 1)
+    except Exception:
+        pass
+
+    import os
+    if hasattr(os, "getloadavg"):
+        try:
+            metrics["load_average"] = [round(x, 2) for x in os.getloadavg()]
+        except Exception:
+            pass
+
+    try:
+        metrics["process_count"] = len(psutil.pids())
+    except Exception:
+        pass
+
+    try:
+        metrics["network_stats"] = {
+            "packets_sent": net.packets_sent,
+            "packets_recv": net.packets_recv,
+            "errin": net.errin,
+            "errout": net.errout,
+        }
+    except Exception:
+        pass
+
+    return metrics
+
 
 
 # ---------------------------------------------------------------------------
