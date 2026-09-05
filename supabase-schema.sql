@@ -146,6 +146,40 @@ ALTER TABLE public.servers
 ALTER TABLE public.server_metrics
   ALTER COLUMN estimated_cost_per_hour DROP NOT NULL;
 
+-- AWS resource discovery metadata
+ALTER TABLE public.servers
+  ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'agent'
+    CHECK (source IN ('agent', 'aws_discovery'));
+ALTER TABLE public.servers
+  ADD COLUMN IF NOT EXISTS aws_instance_id TEXT UNIQUE;
+ALTER TABLE public.servers
+  ADD COLUMN IF NOT EXISTS aws_region TEXT;
+ALTER TABLE public.servers
+  ADD COLUMN IF NOT EXISTS aws_availability_zone TEXT;
+ALTER TABLE public.servers
+  ADD COLUMN IF NOT EXISTS aws_state TEXT;
+ALTER TABLE public.servers
+  ADD COLUMN IF NOT EXISTS aws_launch_time TIMESTAMPTZ;
+ALTER TABLE public.servers
+  ADD COLUMN IF NOT EXISTS aws_tags JSONB DEFAULT '{}'::jsonb;
+ALTER TABLE public.servers
+  ADD COLUMN IF NOT EXISTS last_discovered_at TIMESTAMPTZ;
+
+-- Expanded psutil telemetry metrics
+ALTER TABLE public.server_metrics
+  ADD COLUMN IF NOT EXISTS disk_usage FLOAT;
+ALTER TABLE public.server_metrics
+  ADD COLUMN IF NOT EXISTS disk_io JSONB;
+ALTER TABLE public.server_metrics
+  ADD COLUMN IF NOT EXISTS system_uptime FLOAT;
+ALTER TABLE public.server_metrics
+  ADD COLUMN IF NOT EXISTS load_average JSONB;
+ALTER TABLE public.server_metrics
+  ADD COLUMN IF NOT EXISTS process_count INTEGER;
+ALTER TABLE public.server_metrics
+  ADD COLUMN IF NOT EXISTS network_stats JSONB;
+
+
 -- ================================================================
 -- Row Level Security — users only access their own infrastructure.
 -- (The backend writes through the service-role key, which bypasses
@@ -222,3 +256,486 @@ GRANT EXECUTE ON FUNCTION public.metrics_baseline(uuid, integer)
   TO authenticated, service_role;
 GRANT EXECUTE ON FUNCTION public.metrics_utilization(uuid, integer, float8, float8)
   TO authenticated, service_role;
+
+-- ================================================================
+-- Phase 2: Advanced Anomaly Detection & Cost Optimization Engine
+-- ================================================================
+
+CREATE TABLE IF NOT EXISTS public.anomaly_events (
+  id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  server_id           UUID NOT NULL REFERENCES public.servers(id) ON DELETE CASCADE,
+  metric_name         TEXT NOT NULL,
+  current_value       FLOAT NOT NULL,
+  baseline_value      FLOAT NOT NULL,
+  deviation_sigma     FLOAT,
+  severity            TEXT NOT NULL CHECK (severity IN ('info', 'warning', 'critical')),
+  consecutive_count   INT NOT NULL DEFAULT 1,
+  duration_seconds    INT NOT NULL DEFAULT 0,
+  detection_method    TEXT NOT NULL,
+  explanation         TEXT NOT NULL,
+  meta                JSONB NOT NULL DEFAULT '{}'::jsonb,
+  resolved            BOOLEAN NOT NULL DEFAULT false,
+  created_at          TIMESTAMPTZ DEFAULT timezone('utc'::text, now()) NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_anomaly_events_server
+  ON public.anomaly_events (server_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_anomaly_events_unresolved
+  ON public.anomaly_events (resolved, severity, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS public.optimization_recommendations (
+  id                          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  server_id                   UUID NOT NULL REFERENCES public.servers(id) ON DELETE CASCADE,
+  service_name                TEXT NOT NULL DEFAULT 'ec2',
+  resource_id                 TEXT,
+  resource_name               TEXT NOT NULL,
+  region                      TEXT,
+  recommendation_type         TEXT NOT NULL CHECK (recommendation_type IN ('IDLE_RESOURCE', 'LOW_UTILIZATION', 'RIGHT_SIZING', 'COST_SPIKE', 'UNATTACHED_WASTE')),
+  severity                    TEXT NOT NULL DEFAULT 'warning' CHECK (severity IN ('info', 'warning', 'critical')),
+  current_cost_monthly        NUMERIC(10,2) NOT NULL DEFAULT 0.00,
+  estimated_savings_monthly   NUMERIC(10,2) NOT NULL DEFAULT 0.00,
+  estimated_avoidable_cost    NUMERIC(10,2) NOT NULL DEFAULT 0.00,
+  confidence                  TEXT NOT NULL CHECK (confidence IN ('HIGH', 'MEDIUM', 'LOW')),
+  pricing_source              TEXT NOT NULL DEFAULT 'aws_catalog',
+  problem_summary             TEXT NOT NULL,
+  action_recommendation       TEXT NOT NULL,
+  target_resource_type        TEXT,
+  evidence                    JSONB NOT NULL DEFAULT '{}'::jsonb,
+  status                      TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'applied', 'dismissed')),
+  created_at                  TIMESTAMPTZ DEFAULT timezone('utc'::text, now()) NOT NULL,
+  updated_at                  TIMESTAMPTZ DEFAULT timezone('utc'::text, now()) NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_opt_recs_server
+  ON public.optimization_recommendations (server_id, status, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_opt_recs_status_type
+  ON public.optimization_recommendations (status, recommendation_type, severity);
+
+ALTER TABLE public.anomaly_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.optimization_recommendations ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "users_read_own_anomaly_events" ON public.anomaly_events
+  FOR SELECT USING (
+    EXISTS (SELECT 1 FROM public.servers s
+            WHERE s.id = anomaly_events.server_id AND s.owner_id = auth.uid())
+  );
+
+CREATE POLICY "users_manage_own_anomaly_events" ON public.anomaly_events
+  FOR ALL USING (
+    EXISTS (SELECT 1 FROM public.servers s
+            WHERE s.id = anomaly_events.server_id AND s.owner_id = auth.uid())
+  );
+
+CREATE POLICY "users_read_own_opt_recommendations" ON public.optimization_recommendations
+  FOR SELECT USING (
+    EXISTS (SELECT 1 FROM public.servers s
+            WHERE s.id = optimization_recommendations.server_id AND s.owner_id = auth.uid())
+  );
+
+CREATE POLICY "users_manage_own_opt_recommendations" ON public.optimization_recommendations
+  FOR ALL USING (
+    EXISTS (SELECT 1 FROM public.servers s
+            WHERE s.id = optimization_recommendations.server_id AND s.owner_id = auth.uid())
+  );
+
+-- ================================================================
+-- Phase 3: Smart Alerting, Alert Rules, Incidents & Timeline
+-- ================================================================
+
+CREATE TABLE IF NOT EXISTS public.notification_channels (
+  id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  owner_id     UUID REFERENCES auth.users(id),
+  name         TEXT NOT NULL,
+  channel_type TEXT NOT NULL CHECK (channel_type IN ('webhook', 'discord', 'slack', 'email')),
+  config       JSONB NOT NULL DEFAULT '{}'::jsonb,
+  enabled      BOOLEAN NOT NULL DEFAULT true,
+  created_at   TIMESTAMPTZ DEFAULT timezone('utc'::text, now()) NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS public.alert_rules (
+  id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  owner_id          UUID REFERENCES auth.users(id),
+  name              TEXT NOT NULL,
+  rule_type         TEXT NOT NULL CHECK (rule_type IN ('CPU_ANOMALY', 'RAM_ANOMALY', 'NETWORK_ANOMALY', 'IDLE_RESOURCE', 'BUDGET_SPIKE', 'SAVINGS_THRESHOLD', 'CUSTOM')),
+  condition_config  JSONB NOT NULL DEFAULT '{}'::jsonb,
+  severity          TEXT NOT NULL DEFAULT 'warning' CHECK (severity IN ('info', 'warning', 'critical')),
+  cooldown_minutes  INT NOT NULL DEFAULT 15,
+  channels          JSONB NOT NULL DEFAULT '["webhook"]'::jsonb,
+  enabled           BOOLEAN NOT NULL DEFAULT true,
+  created_at        TIMESTAMPTZ DEFAULT timezone('utc'::text, now()) NOT NULL,
+  updated_at        TIMESTAMPTZ DEFAULT timezone('utc'::text, now()) NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS public.incidents (
+  id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  server_id           UUID NOT NULL REFERENCES public.servers(id) ON DELETE CASCADE,
+  title               TEXT NOT NULL,
+  description         TEXT NOT NULL,
+  incident_type       TEXT NOT NULL,
+  severity            TEXT NOT NULL DEFAULT 'warning' CHECK (severity IN ('info', 'warning', 'critical')),
+  status              TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'acknowledged', 'resolved')),
+  root_cause_summary  TEXT,
+  ai_investigation    JSONB NOT NULL DEFAULT '{}'::jsonb,
+  acknowledged_at     TIMESTAMPTZ,
+  acknowledged_by     TEXT,
+  resolved_at         TIMESTAMPTZ,
+  resolved_by         TEXT,
+  created_at          TIMESTAMPTZ DEFAULT timezone('utc'::text, now()) NOT NULL,
+  updated_at          TIMESTAMPTZ DEFAULT timezone('utc'::text, now()) NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_incidents_server_status
+  ON public.incidents (server_id, status, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_incidents_status_severity
+  ON public.incidents (status, severity, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS public.incident_timeline (
+  id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  incident_id  UUID NOT NULL REFERENCES public.incidents(id) ON DELETE CASCADE,
+  event_type   TEXT NOT NULL,
+  actor        TEXT NOT NULL DEFAULT 'system',
+  message      TEXT NOT NULL,
+  meta         JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at   TIMESTAMPTZ DEFAULT timezone('utc'::text, now()) NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_incident_timeline_inc
+  ON public.incident_timeline (incident_id, created_at ASC);
+
+CREATE TABLE IF NOT EXISTS public.incident_notes (
+  id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  incident_id  UUID NOT NULL REFERENCES public.incidents(id) ON DELETE CASCADE,
+  user_id      UUID REFERENCES auth.users(id),
+  author_name  TEXT NOT NULL DEFAULT 'Operator',
+  note_text    TEXT NOT NULL,
+  created_at   TIMESTAMPTZ DEFAULT timezone('utc'::text, now()) NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS public.notification_logs (
+  id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  rule_id           UUID REFERENCES public.alert_rules(id) ON DELETE SET NULL,
+  incident_id       UUID REFERENCES public.incidents(id) ON DELETE SET NULL,
+  server_id         UUID REFERENCES public.servers(id) ON DELETE CASCADE,
+  channel_type      TEXT NOT NULL,
+  severity          TEXT NOT NULL,
+  recipient_target  TEXT,
+  status            TEXT NOT NULL CHECK (status IN ('sent', 'failed', 'cooldown_skipped')),
+  payload           JSONB NOT NULL DEFAULT '{}'::jsonb,
+  error_message     TEXT,
+  created_at        TIMESTAMPTZ DEFAULT timezone('utc'::text, now()) NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_notif_logs_incident
+  ON public.notification_logs (incident_id, created_at DESC);
+
+ALTER TABLE public.notification_channels ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.alert_rules ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.incidents ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.incident_timeline ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.incident_notes ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.notification_logs ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "users_manage_own_channels" ON public.notification_channels
+  FOR ALL USING (auth.uid() = owner_id OR owner_id IS NULL);
+
+CREATE POLICY "users_manage_own_rules" ON public.alert_rules
+  FOR ALL USING (auth.uid() = owner_id OR owner_id IS NULL);
+
+CREATE POLICY "users_manage_own_incidents" ON public.incidents
+  FOR ALL USING (
+    EXISTS (SELECT 1 FROM public.servers s
+            WHERE s.id = incidents.server_id AND (s.owner_id = auth.uid() OR s.owner_id IS NULL))
+  );
+
+CREATE POLICY "users_manage_own_incident_timeline" ON public.incident_timeline
+  FOR ALL USING (
+    EXISTS (SELECT 1 FROM public.incidents i
+            JOIN public.servers s ON s.id = i.server_id
+            WHERE i.id = incident_timeline.incident_id AND (s.owner_id = auth.uid() OR s.owner_id IS NULL))
+  );
+
+CREATE POLICY "users_manage_own_incident_notes" ON public.incident_notes
+  FOR ALL USING (
+    EXISTS (SELECT 1 FROM public.incidents i
+            JOIN public.servers s ON s.id = i.server_id
+            WHERE i.id = incident_notes.incident_id AND (s.owner_id = auth.uid() OR s.owner_id IS NULL))
+  );
+
+CREATE POLICY "users_read_own_notif_logs" ON public.notification_logs
+  FOR SELECT USING (
+    server_id IS NULL OR EXISTS (SELECT 1 FROM public.servers s
+            WHERE s.id = notification_logs.server_id AND (s.owner_id = auth.uid() OR s.owner_id IS NULL))
+  );
+
+-- ================================================================
+-- Phase 4: Multi-Tenant SaaS AWS Connection System
+-- ================================================================
+
+CREATE TABLE IF NOT EXISTS public.aws_connections (
+  id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id          UUID REFERENCES auth.users(id) ON DELETE CASCADE,
+  aws_account_id   TEXT,
+  role_arn         TEXT,
+  external_id      TEXT NOT NULL UNIQUE,
+  region           TEXT NOT NULL DEFAULT 'us-east-1',
+  display_name     TEXT NOT NULL DEFAULT 'AWS Account',
+  status           TEXT NOT NULL DEFAULT 'pending'
+                     CHECK (status IN ('pending', 'connected', 'error', 'disconnected')),
+  error_message    TEXT,
+  last_verified_at TIMESTAMPTZ,
+  last_sync_at     TIMESTAMPTZ,
+  created_at       TIMESTAMPTZ DEFAULT timezone('utc'::text, now()) NOT NULL,
+  updated_at       TIMESTAMPTZ DEFAULT timezone('utc'::text, now()) NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_aws_connections_user_status
+  ON public.aws_connections (user_id, status);
+
+CREATE INDEX IF NOT EXISTS idx_aws_connections_external_id
+  ON public.aws_connections (external_id);
+
+ALTER TABLE public.servers
+  ADD COLUMN IF NOT EXISTS aws_connection_id UUID REFERENCES public.aws_connections(id) ON DELETE SET NULL;
+
+CREATE INDEX IF NOT EXISTS idx_servers_aws_connection
+  ON public.servers (aws_connection_id);
+
+ALTER TABLE public.aws_connections ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "Users can view own AWS connections" ON public.aws_connections;
+CREATE POLICY "Users can view own AWS connections"
+  ON public.aws_connections FOR SELECT
+  TO authenticated
+  USING (auth.uid() = user_id);
+
+DROP POLICY IF EXISTS "Users can insert own AWS connections" ON public.aws_connections;
+CREATE POLICY "Users can insert own AWS connections"
+  ON public.aws_connections FOR INSERT
+  TO authenticated
+  WITH CHECK (auth.uid() = user_id);
+
+DROP POLICY IF EXISTS "Users can update own AWS connections" ON public.aws_connections;
+CREATE POLICY "Users can update own AWS connections"
+  ON public.aws_connections FOR UPDATE
+  TO authenticated
+  USING (auth.uid() = user_id)
+  WITH CHECK (auth.uid() = user_id);
+
+DROP POLICY IF EXISTS "Users can delete own AWS connections" ON public.aws_connections;
+CREATE POLICY "Users can delete own AWS connections"
+  ON public.aws_connections FOR DELETE
+  TO authenticated
+  USING (auth.uid() = user_id);
+
+-- ================================================================
+-- Phase 5: Multi-Tenant SaaS Organizations, RBAC & Audit Logs
+-- ================================================================
+
+CREATE TABLE IF NOT EXISTS public.organizations (
+    id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name                 TEXT NOT NULL,
+    slug                 TEXT NOT NULL UNIQUE,
+    plan_tier            TEXT NOT NULL DEFAULT 'free' CHECK (plan_tier IN ('free', 'starter', 'pro', 'enterprise')),
+    max_aws_connections INT NOT NULL DEFAULT 5,
+    retention_days       INT NOT NULL DEFAULT 30,
+    created_at           TIMESTAMPTZ DEFAULT timezone('utc'::text, now()) NOT NULL,
+    updated_at           TIMESTAMPTZ DEFAULT timezone('utc'::text, now()) NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_organizations_slug ON public.organizations(slug);
+
+CREATE TABLE IF NOT EXISTS public.organization_members (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL REFERENCES public.organizations(id) ON DELETE CASCADE,
+    user_id         UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+    role            TEXT NOT NULL DEFAULT 'MEMBER' CHECK (role IN ('OWNER', 'ADMIN', 'MEMBER', 'VIEWER')),
+    invited_email   TEXT,
+    created_at      TIMESTAMPTZ DEFAULT timezone('utc'::text, now()) NOT NULL,
+    updated_at      TIMESTAMPTZ DEFAULT timezone('utc'::text, now()) NOT NULL,
+    UNIQUE (organization_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_org_members_user ON public.organization_members(user_id);
+CREATE INDEX IF NOT EXISTS idx_org_members_org ON public.organization_members(organization_id);
+
+CREATE TABLE IF NOT EXISTS public.audit_logs (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL REFERENCES public.organizations(id) ON DELETE CASCADE,
+    actor_id        UUID REFERENCES auth.users(id) ON DELETE SET NULL,
+    actor_email     TEXT,
+    action          TEXT NOT NULL,
+    resource_type   TEXT NOT NULL,
+    resource_id     TEXT,
+    metadata        JSONB DEFAULT '{}'::jsonb NOT NULL,
+    created_at      TIMESTAMPTZ DEFAULT timezone('utc'::text, now()) NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_logs_org_time ON public.audit_logs(organization_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_action ON public.audit_logs(action);
+
+ALTER TABLE public.servers
+ADD COLUMN IF NOT EXISTS organization_id UUID REFERENCES public.organizations(id) ON DELETE CASCADE;
+
+CREATE INDEX IF NOT EXISTS idx_servers_org ON public.servers(organization_id);
+
+ALTER TABLE public.aws_connections
+ADD COLUMN IF NOT EXISTS organization_id UUID REFERENCES public.organizations(id) ON DELETE CASCADE,
+ADD COLUMN IF NOT EXISTS health_status TEXT DEFAULT 'UNVERIFIED' CHECK (health_status IN ('HEALTHY', 'DEGRADED', 'ERROR', 'UNVERIFIED')),
+ADD COLUMN IF NOT EXISTS health_checks JSONB DEFAULT '{}'::jsonb,
+ADD COLUMN IF NOT EXISTS last_sync_started TIMESTAMPTZ,
+ADD COLUMN IF NOT EXISTS last_sync_completed TIMESTAMPTZ,
+ADD COLUMN IF NOT EXISTS sync_status TEXT DEFAULT 'IDLE' CHECK (sync_status IN ('IDLE', 'SYNCING', 'SUCCESS', 'FAILED')),
+ADD COLUMN IF NOT EXISTS sync_error TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_aws_connections_org ON public.aws_connections(organization_id);
+
+ALTER TABLE public.incidents
+ADD COLUMN IF NOT EXISTS organization_id UUID REFERENCES public.organizations(id) ON DELETE CASCADE;
+
+ALTER TABLE public.alert_rules
+ADD COLUMN IF NOT EXISTS organization_id UUID REFERENCES public.organizations(id) ON DELETE CASCADE;
+
+ALTER TABLE public.notification_channels
+ADD COLUMN IF NOT EXISTS organization_id UUID REFERENCES public.organizations(id) ON DELETE CASCADE;
+
+ALTER TABLE public.cost_anomalies
+ADD COLUMN IF NOT EXISTS organization_id UUID REFERENCES public.organizations(id) ON DELETE CASCADE;
+
+ALTER TABLE public.optimization_recommendations
+ADD COLUMN IF NOT EXISTS organization_id UUID REFERENCES public.organizations(id) ON DELETE CASCADE;
+
+-- Helper functions for RLS & RBAC
+CREATE OR REPLACE FUNCTION public.is_org_member(p_org_id UUID)
+RETURNS BOOLEAN AS $$
+BEGIN
+    RETURN EXISTS (
+        SELECT 1 FROM public.organization_members
+        WHERE organization_id = p_org_id AND user_id = auth.uid()
+    );
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER STABLE;
+
+CREATE OR REPLACE FUNCTION public.get_org_role(p_org_id UUID)
+RETURNS TEXT AS $$
+DECLARE
+    v_role TEXT;
+BEGIN
+    SELECT role INTO v_role FROM public.organization_members
+    WHERE organization_id = p_org_id AND user_id = auth.uid();
+    RETURN v_role;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER STABLE;
+
+CREATE OR REPLACE FUNCTION public.is_org_admin(p_org_id UUID)
+RETURNS BOOLEAN AS $$
+BEGIN
+    RETURN EXISTS (
+        SELECT 1 FROM public.organization_members
+        WHERE organization_id = p_org_id AND user_id = auth.uid() AND role IN ('OWNER', 'ADMIN')
+    );
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER STABLE;
+
+CREATE OR REPLACE FUNCTION public.is_org_owner(p_org_id UUID)
+RETURNS BOOLEAN AS $$
+BEGIN
+    RETURN EXISTS (
+        SELECT 1 FROM public.organization_members
+        WHERE organization_id = p_org_id AND user_id = auth.uid() AND role = 'OWNER'
+    );
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER STABLE;
+
+ALTER TABLE public.organizations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.organization_members ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.audit_logs ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "Members can view their organizations" ON public.organizations;
+CREATE POLICY "Members can view their organizations"
+    ON public.organizations FOR SELECT
+    TO authenticated
+    USING (public.is_org_member(id));
+
+DROP POLICY IF EXISTS "Authenticated users can create organizations" ON public.organizations;
+CREATE POLICY "Authenticated users can create organizations"
+    ON public.organizations FOR INSERT
+    TO authenticated
+    WITH CHECK (true);
+
+DROP POLICY IF EXISTS "Owners can update organization settings" ON public.organizations;
+CREATE POLICY "Owners can update organization settings"
+    ON public.organizations FOR UPDATE
+    TO authenticated
+    USING (public.is_org_owner(id))
+    WITH CHECK (public.is_org_owner(id));
+
+DROP POLICY IF EXISTS "Owners can delete organization" ON public.organizations;
+CREATE POLICY "Owners can delete organization"
+    ON public.organizations FOR DELETE
+    TO authenticated
+    USING (public.is_org_owner(id));
+
+DROP POLICY IF EXISTS "Service role full access on organizations" ON public.organizations;
+CREATE POLICY "Service role full access on organizations"
+    ON public.organizations FOR ALL
+    TO service_role
+    USING (true)
+    WITH CHECK (true);
+
+DROP POLICY IF EXISTS "Members can view members in their orgs" ON public.organization_members;
+CREATE POLICY "Members can view members in their orgs"
+    ON public.organization_members FOR SELECT
+    TO authenticated
+    USING (public.is_org_member(organization_id));
+
+DROP POLICY IF EXISTS "Admins and Owners can insert org members" ON public.organization_members;
+CREATE POLICY "Admins and Owners can insert org members"
+    ON public.organization_members FOR INSERT
+    TO authenticated
+    WITH CHECK (public.is_org_admin(organization_id) OR auth.uid() = user_id);
+
+DROP POLICY IF EXISTS "Admins and Owners can update org members" ON public.organization_members;
+CREATE POLICY "Admins and Owners can update org members"
+    ON public.organization_members FOR UPDATE
+    TO authenticated
+    USING (public.is_org_admin(organization_id))
+    WITH CHECK (public.is_org_admin(organization_id));
+
+DROP POLICY IF EXISTS "Admins and Owners can delete org members" ON public.organization_members;
+CREATE POLICY "Admins and Owners can delete org members"
+    ON public.organization_members FOR DELETE
+    TO authenticated
+    USING (public.is_org_admin(organization_id) OR auth.uid() = user_id);
+
+DROP POLICY IF EXISTS "Service role full access on organization_members" ON public.organization_members;
+CREATE POLICY "Service role full access on organization_members"
+    ON public.organization_members FOR ALL
+    TO service_role
+    USING (true)
+    WITH CHECK (true);
+
+DROP POLICY IF EXISTS "Members can view audit logs for their org" ON public.audit_logs;
+CREATE POLICY "Members can view audit logs for their org"
+    ON public.audit_logs FOR SELECT
+    TO authenticated
+    USING (public.is_org_member(organization_id));
+
+DROP POLICY IF EXISTS "Members can insert audit logs for their org" ON public.audit_logs;
+CREATE POLICY "Members can insert audit logs for their org"
+    ON public.audit_logs FOR INSERT
+    TO authenticated
+    WITH CHECK (public.is_org_member(organization_id));
+
+DROP POLICY IF EXISTS "Service role full access on audit_logs" ON public.audit_logs;
+CREATE POLICY "Service role full access on audit_logs"
+    ON public.audit_logs FOR ALL
+    TO service_role
+    USING (true)
+    WITH CHECK (true);
+
+
+
+
