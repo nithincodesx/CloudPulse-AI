@@ -6,7 +6,7 @@ from typing import Optional
 from uuid import uuid4
 
 from dotenv import load_dotenv
-from fastapi import Body, FastAPI, HTTPException, Request
+from fastapi import Body, Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -18,6 +18,7 @@ from database import (
     create_or_update_incident,
     db_ping,
     delete_alert_rule,
+    delete_server,
     delete_aws_connection,
     delete_notification_channel,
     get_aws_connection,
@@ -25,6 +26,7 @@ from database import (
     get_incident,
     get_latest_cost_date,
     get_server,
+    get_organization_member,
     get_server_by_token,
     init_db,
     insert_alert,
@@ -34,10 +36,13 @@ from database import (
     insert_metric,
     insert_notification_log,
     latest_metrics,
+    sync_known_server,
+    upsert_server,
     list_alert_rules,
     list_alerts,
     list_anomaly_events,
     list_aws_connections,
+    list_aws_connections_for_org,
     list_incident_notes,
     list_incident_timeline,
     list_incidents,
@@ -56,6 +61,15 @@ from database import (
     upsert_notification_channel,
     upsert_optimization_recommendations,
 )
+from auth import (
+    AuthenticatedUser,
+    AuthenticationError,
+    AuthorizationError,
+    authorize_connection,
+    authorize_server,
+    get_current_user,
+    resolve_org_for_user,
+)
 from aws_credentials import (
     generate_cloudformation_quick_launch_url,
     generate_external_id,
@@ -71,7 +85,12 @@ from aws_service import (
 from aws_cost import (
     cloud_configured,
     detect_budget_spikes,
+    detect_cost_anomalies,
+    fetch_account_breakdown,
+    fetch_region_breakdown,
+    fetch_service_breakdown,
     get_cloud_status,
+    get_cost_trends,
     sync_daily_costs,
 )
 from aws_discovery import discovery_configured, sync_aws_resources
@@ -153,6 +172,7 @@ from models import (
     ServerOut,
     ServerStatusResponse,
     ServerStatusUpdate,
+    ServerTerminateResponse,
     SyncEngineResult,
     SyncResult,
 )
@@ -350,6 +370,10 @@ def ingest_metrics(request: Request, payload: MetricPayload = Body(...)):
 
     row = insert_metric(metric_data)
 
+    # If the server was awaiting telemetry (pending), transition to active
+    if server.get("status") == "pending":
+        update_server_status(server_id, "active")
+
     # Advanced statistical anomaly detection with time-aware and rolling baselines.
     # We pass recent metrics history to enable hour-of-day/day-of-week comparisons.
     recent_history = latest_metrics(server_id, limit=30)
@@ -487,6 +511,22 @@ def ingest_metrics(request: Request, payload: MetricPayload = Body(...)):
         recorded_at=row.get("recorded_at", datetime.now(timezone.utc)),
         alert_triggered=alert_triggered,
     )
+
+
+@app.post("/api/servers/sync-node")
+def sync_node_endpoint(payload: dict = Body(...)):
+    """Register or sync a node's metadata and ingestion token into the backend.
+
+    The node is also upserted into Supabase (service-role key, RLS bypassed)
+    so the registry and its ingestion tokens survive a backend restart. The
+    upsert only writes the columns it was given: it never overwrites the
+    owner_id the frontend set at provision time.
+    """
+    if not payload.get("id"):
+        raise HTTPException(400, detail="Node ID is required")
+    upsert_server(payload)
+    synced = sync_known_server(payload)
+    return {"status": "synced", "server": synced}
 
 
 @app.get("/api/servers/status", response_model=ServerStatusResponse)
@@ -677,14 +717,19 @@ def initiate_aws_connection(payload: AWSConnectionInitiateRequest = Body(default
 
 
 @app.get("/api/aws/connections", response_model=list[AWSConnectionOut])
-def list_aws_connections_endpoint(user_id: Optional[str] = None):
-    """List all connected AWS accounts."""
-    return list_aws_connections(user_id=user_id)
+def list_aws_connections_endpoint(user: AuthenticatedUser = Depends(get_current_user)):
+    """List AWS connections for the authenticated user's organization."""
+    org_id, _role = resolve_org_for_user(user, None, permission="view_aws_connections")
+    return list_aws_connections_for_org(org_id)
 
 
 @app.post("/api/aws/connections", response_model=AWSConnectionOut)
-def create_aws_connection_endpoint(payload: AWSConnectionCreate = Body(...), user_id: Optional[str] = None):
+def create_aws_connection_endpoint(
+    payload: AWSConnectionCreate = Body(...),
+    user: AuthenticatedUser = Depends(get_current_user),
+):
     """Save newly created AWS cross-account connection and attempt immediate verification."""
+    org_id, _role = resolve_org_for_user(user, None, permission="connect_aws")
     role_arn = payload.role_arn.strip()
     if not validate_role_arn(role_arn):
         raise HTTPException(
@@ -693,7 +738,8 @@ def create_aws_connection_endpoint(payload: AWSConnectionCreate = Body(...), use
         )
 
     conn_data = {
-        "user_id": user_id,
+        "user_id": user.user_id,
+        "organization_id": org_id,
         "role_arn": role_arn,
         "external_id": payload.external_id,
         "region": payload.region,
@@ -709,29 +755,30 @@ def create_aws_connection_endpoint(payload: AWSConnectionCreate = Body(...), use
 
     # Auto-verify connection
     try:
-        verified = verify_and_save_connection(conn_id, user_id=user_id)
+        verified = verify_and_save_connection(conn_id, user_id=user.user_id)
         return verified
     except Exception:  # noqa: BLE001
         return created
 
 
 @app.get("/api/aws/connections/{connection_id}", response_model=AWSConnectionOut)
-def get_aws_connection_endpoint(connection_id: str, user_id: Optional[str] = None):
-    """Get single AWS connection details."""
-    conn = get_aws_connection(connection_id, user_id=user_id)
-    if not conn:
-        raise HTTPException(status_code=404, detail=f"AWS connection {connection_id} not found")
+def get_aws_connection_endpoint(
+    connection_id: str,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Get single AWS connection details. Authorized via JWT + org membership."""
+    conn = authorize_connection(user, connection_id, permission="view_aws_connections")
     return conn
 
 
 @app.post("/api/aws/connections/{connection_id}/verify", response_model=AWSConnectionVerifyResponse)
-def verify_aws_connection_endpoint(connection_id: str, user_id: Optional[str] = None):
+def verify_aws_connection_endpoint(
+    connection_id: str,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
     """Verify an AWS connection by assuming the role and testing permissions."""
-    conn = get_aws_connection(connection_id, user_id=user_id)
-    if not conn:
-        raise HTTPException(status_code=404, detail=f"AWS connection {connection_id} not found")
-
-    verified = verify_and_save_connection(connection_id, user_id=user_id)
+    authorize_connection(user, connection_id, permission="view_aws_connections")
+    verified = verify_and_save_connection(connection_id, user_id=user.user_id)
     is_success = verified.get("status") == "connected"
     return AWSConnectionVerifyResponse(
         success=is_success,
@@ -743,12 +790,12 @@ def verify_aws_connection_endpoint(connection_id: str, user_id: Optional[str] = 
 
 
 @app.get("/api/aws/connections/{connection_id}/health", response_model=AWSHealthDiagnosticResponse)
-def get_aws_connection_health_endpoint(connection_id: str, user_id: Optional[str] = None):
+def get_aws_connection_health_endpoint(
+    connection_id: str,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
     """Run comprehensive granular health checks on an AWS connection."""
-    conn = get_aws_connection(connection_id, user_id=user_id)
-    if not conn:
-        raise HTTPException(status_code=404, detail=f"AWS connection {connection_id} not found")
-
+    conn = authorize_connection(user, connection_id, permission="view_aws_connections")
     diag = diagnose_connection_health(conn)
     update_aws_connection(connection_id, {
         "health_status": diag["health_status"],
@@ -767,30 +814,26 @@ def get_aws_connection_health_endpoint(connection_id: str, user_id: Optional[str
 @app.post("/api/aws/connections/{connection_id}/sync")
 def sync_aws_connection_endpoint(
     connection_id: str,
-    user_id: Optional[str] = None,
-    org_id: Optional[str] = None,
+    user: AuthenticatedUser = Depends(get_current_user),
 ):
     """Run centralized idempotent AWS sync pipeline."""
-    conn = get_aws_connection(connection_id, user_id=user_id)
-    if not conn:
-        raise HTTPException(status_code=404, detail=f"AWS connection {connection_id} not found")
-
+    conn = authorize_connection(user, connection_id, permission="sync_aws")
     result = run_centralized_sync(
         connection_id=connection_id,
-        organization_id=org_id or conn.get("organization_id"),
-        actor_id=user_id,
+        organization_id=conn.get("organization_id"),
+        actor_id=user.user_id,
     )
     return result
 
 
 @app.delete("/api/aws/connections/{connection_id}")
-def delete_aws_connection_endpoint(connection_id: str, user_id: Optional[str] = None):
+def delete_aws_connection_endpoint(
+    connection_id: str,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
     """Disconnect and remove an AWS connection."""
-    conn = get_aws_connection(connection_id, user_id=user_id)
-    if not conn:
-        raise HTTPException(status_code=404, detail=f"AWS connection {connection_id} not found")
-
-    deleted = delete_aws_connection(connection_id, user_id=user_id)
+    conn = authorize_connection(user, connection_id, permission="connect_aws")
+    deleted = delete_aws_connection(connection_id, user_id=user.user_id)
     if not deleted:
         raise HTTPException(status_code=500, detail="Failed to delete AWS connection")
 
@@ -799,7 +842,7 @@ def delete_aws_connection_endpoint(connection_id: str, user_id: Optional[str] = 
             organization_id=conn["organization_id"],
             action=AuditActions.AWS_DISCONNECTED,
             resource_type="AWS_CONNECTION",
-            actor_id=user_id,
+            actor_id=user.user_id,
             resource_id=connection_id,
             metadata={"display_name": conn.get("display_name"), "role_arn": conn.get("role_arn")},
         )
@@ -812,12 +855,10 @@ def delete_aws_connection_endpoint(connection_id: str, user_id: Optional[str] = 
 # ---------------------------------------------------------------------------
 
 @app.get("/api/organizations", response_model=list[OrganizationOut])
-def list_organizations_endpoint(user_id: Optional[str] = None, user_email: Optional[str] = None):
+def list_organizations_endpoint(user: AuthenticatedUser = Depends(get_current_user)):
     """List all organizations/workspaces for the authenticated user, auto-provisioning default if none."""
-    if not user_id:
-        return []
-    default_org = get_or_create_default_workspace(user_id, user_email=user_email)
-    orgs = list_organizations_for_user(user_id)
+    default_org = get_or_create_default_workspace(user.user_id, user_email=user.email)
+    orgs = list_organizations_for_user(user.user_id)
     if not orgs and default_org:
         orgs = [default_org]
 
@@ -832,14 +873,15 @@ def list_organizations_endpoint(user_id: Optional[str] = None, user_email: Optio
 
 
 @app.post("/api/organizations", response_model=OrganizationOut)
-def create_organization_endpoint(payload: OrganizationCreate, user_id: Optional[str] = None, user_email: Optional[str] = None):
+def create_organization_endpoint(
+    payload: OrganizationCreate,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
     """Create a new organization workspace and assign the creator as OWNER."""
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Authentication required")
     org = provision_organization(
         name=payload.name,
-        user_id=user_id,
-        user_email=user_email,
+        user_id=user.user_id,
+        user_email=user.email,
         plan_tier=payload.plan_tier,
     )
     counts = get_organization_counts(org["id"])
@@ -850,15 +892,14 @@ def create_organization_endpoint(payload: OrganizationCreate, user_id: Optional[
 
 
 @app.get("/api/organizations/{org_id}", response_model=OrganizationOut)
-def get_organization_endpoint(org_id: str, user_id: Optional[str] = None):
-    """Get single organization details."""
-    org = get_organization_by_id(org_id)
-    if not org:
-        raise HTTPException(status_code=404, detail=f"Organization {org_id} not found")
-    if user_id:
-        member = get_organization_member(org_id, user_id)
-        org["user_role"] = member.get("role") if member else None
+def get_organization_endpoint(
+    org_id: str,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Get single organization details. Authorized via JWT + org membership."""
+    org, role = resolve_org_for_user(user, org_id, permission="view_org")
     counts = get_organization_counts(org_id)
+    org["user_role"] = role
     org["members_count"] = counts["members_count"]
     org["aws_connections_count"] = counts["aws_connections_count"]
     org["servers_count"] = counts["servers_count"]
@@ -866,38 +907,38 @@ def get_organization_endpoint(org_id: str, user_id: Optional[str] = None):
 
 
 @app.put("/api/organizations/{org_id}", response_model=OrganizationOut)
-def update_organization_endpoint(org_id: str, payload: OrganizationUpdate, user_id: Optional[str] = None):
+def update_organization_endpoint(
+    org_id: str,
+    payload: OrganizationUpdate,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
     """Update organization settings (OWNER only)."""
-    if user_id:
-        member = get_organization_member(org_id, user_id)
-        if not member or member.get("role") != "OWNER":
-            raise HTTPException(status_code=403, detail="Only Organization OWNER can update settings")
+    resolve_org_for_user(user, org_id, permission="manage_org_settings")
 
     updates = {k: v for k, v in payload.dict().items() if v is not None}
     updated = update_organization(org_id, updates)
     if not updated:
         raise HTTPException(status_code=404, detail=f"Organization {org_id} not found")
 
-    if user_id:
-        log_audit_event(
-            organization_id=org_id,
-            action=AuditActions.SETTINGS_UPDATED,
-            resource_type="ORGANIZATION",
-            actor_id=user_id,
-            resource_id=org_id,
-            metadata=updates,
-        )
+    log_audit_event(
+        organization_id=org_id,
+        action=AuditActions.SETTINGS_UPDATED,
+        resource_type="ORGANIZATION",
+        actor_id=user.user_id,
+        resource_id=org_id,
+        metadata=updates,
+    )
 
     return updated
 
 
 @app.delete("/api/organizations/{org_id}")
-def delete_organization_endpoint(org_id: str, user_id: Optional[str] = None):
+def delete_organization_endpoint(
+    org_id: str,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
     """Delete organization workspace (OWNER only)."""
-    if user_id:
-        member = get_organization_member(org_id, user_id)
-        if not member or member.get("role") != "OWNER":
-            raise HTTPException(status_code=403, detail="Only Organization OWNER can delete organization")
+    resolve_org_for_user(user, org_id, permission="delete_org")
 
     ok = delete_organization(org_id)
     if not ok:
@@ -910,25 +951,29 @@ def delete_organization_endpoint(org_id: str, user_id: Optional[str] = None):
 # ---------------------------------------------------------------------------
 
 @app.get("/api/organizations/{org_id}/members", response_model=list[OrganizationMemberOut])
-def list_org_members_endpoint(org_id: str):
+def list_org_members_endpoint(
+    org_id: str,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
     """List all members of an organization."""
+    resolve_org_for_user(user, org_id, permission="view_members")
     return list_organization_members(org_id)
 
 
 @app.post("/api/organizations/{org_id}/members", response_model=OrganizationMemberOut)
-def invite_org_member_endpoint(org_id: str, payload: OrganizationMemberInvite, user_id: Optional[str] = None, user_email: Optional[str] = None):
+def invite_org_member_endpoint(
+    org_id: str,
+    payload: OrganizationMemberInvite,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
     """Invite a new member to the organization (OWNER or ADMIN)."""
-    if user_id:
-        member = get_organization_member(org_id, user_id)
-        if not member or member.get("role") not in ("OWNER", "ADMIN"):
-            raise HTTPException(status_code=403, detail="Only Organization OWNER or ADMIN can invite members")
-
+    resolve_org_for_user(user, org_id, permission="manage_members")
     invited = invite_member_to_org(
         organization_id=org_id,
         email=payload.email,
         role=payload.role,
-        inviter_id=user_id or "system",
-        inviter_email=user_email,
+        inviter_id=user.user_id,
+        inviter_email=user.email,
     )
     return invited
 
@@ -938,38 +983,33 @@ def update_org_member_role_endpoint(
     org_id: str,
     member_id: str,
     payload: OrganizationMemberUpdateRole,
-    user_id: Optional[str] = None,
-    user_email: Optional[str] = None,
+    user: AuthenticatedUser = Depends(get_current_user),
 ):
     """Update a member's role (OWNER only)."""
-    if user_id:
-        member = get_organization_member(org_id, user_id)
-        if not member or member.get("role") != "OWNER":
-            raise HTTPException(status_code=403, detail="Only Organization OWNER can change member roles")
-
+    resolve_org_for_user(user, org_id, permission="manage_members")
     updated = change_member_role(
         organization_id=org_id,
         member_id=member_id,
         new_role=payload.role,
-        actor_id=user_id or "system",
-        actor_email=user_email,
+        actor_id=user.user_id,
+        actor_email=user.email,
     )
     return updated
 
 
 @app.delete("/api/organizations/{org_id}/members/{member_id}")
-def delete_org_member_endpoint(org_id: str, member_id: str, user_id: Optional[str] = None, user_email: Optional[str] = None):
+def delete_org_member_endpoint(
+    org_id: str,
+    member_id: str,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
     """Remove a member from the organization (OWNER or ADMIN)."""
-    if user_id:
-        member = get_organization_member(org_id, user_id)
-        if not member or member.get("role") not in ("OWNER", "ADMIN"):
-            raise HTTPException(status_code=403, detail="Only Organization OWNER or ADMIN can remove members")
-
+    resolve_org_for_user(user, org_id, permission="manage_members")
     ok = remove_member_from_org(
         organization_id=org_id,
         member_id=member_id,
-        actor_id=user_id or "system",
-        actor_email=user_email,
+        actor_id=user.user_id,
+        actor_email=user.email,
     )
     if not ok:
         raise HTTPException(status_code=500, detail="Failed to remove member")
@@ -983,12 +1023,13 @@ def delete_org_member_endpoint(org_id: str, member_id: str, user_id: Optional[st
 @app.get("/api/organizations/{org_id}/audit-logs", response_model=list[AuditLogOut])
 def get_org_audit_logs_endpoint(
     org_id: str,
+    user: AuthenticatedUser = Depends(get_current_user),
     limit: int = 50,
     offset: int = 0,
     action: Optional[str] = None,
-    user_id: Optional[str] = None,
 ):
     """Get audit trail of sensitive actions in an organization."""
+    resolve_org_for_user(user, org_id, permission="view_audit_logs")
     return get_audit_trail(
         organization_id=org_id,
         limit=limit,
@@ -998,8 +1039,12 @@ def get_org_audit_logs_endpoint(
 
 
 @app.get("/api/organizations/{org_id}/usage", response_model=OrganizationUsageOut)
-def get_org_usage_endpoint(org_id: str):
+def get_org_usage_endpoint(
+    org_id: str,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
     """Get billing-ready usage metrics and limit utilization for an organization."""
+    resolve_org_for_user(user, org_id, permission="view_org")
     return calculate_organization_usage(org_id)
 
 
@@ -1028,38 +1073,274 @@ def generate_insight(request: Request):
     return result
 
 
-@app.get("/api/alerts")
-def get_all_alerts():
-    """Return all alerts, resolved and unresolved."""
-    return list_alerts(unresolved_only=False)
-
-
-
 @app.get("/api/servers/{server_id}/metrics")
-def server_metrics(server_id: str, limit: int = 20):
-    """Return historical metrics for a single server."""
+def server_metrics(
+    server_id: str,
+    user: AuthenticatedUser = Depends(get_current_user),
+    limit: int = 20,
+):
+    """Return historical metrics for a single server. Authorized via JWT + org membership."""
+    authorize_server(user, server_id, permission="view_resources")
     return latest_metrics(server_id, limit=limit)
 
 
+@app.get("/api/alerts")
+def get_all_alerts(user: AuthenticatedUser = Depends(get_current_user)):
+    """Return all alerts, resolved and unresolved. Scoped to user's organization."""
+    org_id, _role = resolve_org_for_user(user, None, permission="view_alerts")
+    return list_alerts(org_id=org_id, unresolved_only=False)
+
+
+
+@app.get("/api/costs/account")
+def get_account_costs(days: int = 30):
+    """Get cost breakdown by AWS account for multi-account organizations."""
+    user = get_current_user()
+    org_id, _role = resolve_org_for_user(user, None, permission="view_costs")
+    
+    # Get the organization's AWS connections
+    connections = list_aws_connections_for_org(org_id)
+    if not connections:
+        return {"days": days, "accounts": [], "total": 0.0, "source": "none"}
+    
+    # Use the first active connection
+    connection = next((c for c in connections if c.get("status") == "active"), connections[0])
+    
+    try:
+        rows = fetch_account_breakdown(days_back=days, connection=connection)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Cost Explorer error: {exc}")
+    
+    # Aggregate by account
+    account_totals = {}
+    for row in rows:
+        account = row["account_id"]
+        account_totals[account] = account_totals.get(account, 0.0) + row["amount"]
+    
+    total = sum(account_totals.values())
+    accounts = [
+        {"account_id": k, "total_cost": round(v, 2), "percentage": round(v / total * 100, 1) if total > 0 else 0.0}
+        for k, v in sorted(account_totals.items(), key=lambda x: x[1], reverse=True)
+    ]
+    
+    return {
+        "days": days,
+        "accounts": accounts,
+        "total": round(total, 2),
+        "source": "aws_cost_explorer",
+    }
+
+
+@app.get("/api/costs/services")
+def get_service_costs(days: int = 30):
+    """Get cost breakdown by AWS service."""
+    user = get_current_user()
+    org_id, _role = resolve_org_for_user(user, None, permission="view_costs")
+    
+    connections = list_aws_connections_for_org(org_id)
+    if not connections:
+        return {"days": days, "services": [], "total": 0.0, "source": "none"}
+    
+    connection = next((c for c in connections if c.get("status") == "active"), connections[0])
+    
+    try:
+        rows = fetch_service_breakdown(days_back=days, connection=connection)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Cost Explorer error: {exc}")
+    
+    # Aggregate by service
+    service_totals = {}
+    for row in rows:
+        service = row["service"]
+        service_totals[service] = service_totals.get(service, 0.0) + row["amount"]
+    
+    total = sum(service_totals.values())
+    services = [
+        {"service": k, "total_cost": round(v, 2), "percentage": round(v / total * 100, 1) if total > 0 else 0.0}
+        for k, v in sorted(service_totals.items(), key=lambda x: x[1], reverse=True)
+    ]
+    
+    return {
+        "days": days,
+        "services": services,
+        "total": round(total, 2),
+        "source": "aws_cost_explorer",
+    }
+
+
+@app.get("/api/costs/regions")
+def get_region_costs(days: int = 30):
+    """Get cost breakdown by AWS region."""
+    user = get_current_user()
+    org_id, _role = resolve_org_for_user(user, None, permission="view_costs")
+    
+    connections = list_aws_connections_for_org(org_id)
+    if not connections:
+        return {"days": days, "regions": [], "total": 0.0, "source": "none"}
+    
+    connection = next((c for c in connections if c.get("status") == "active"), connections[0])
+    
+    try:
+        rows = fetch_region_breakdown(days_back=days, connection=connection)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Cost Explorer error: {exc}")
+    
+    # Aggregate by region
+    region_totals = {}
+    for row in rows:
+        region = row["region"]
+        region_totals[region] = region_totals.get(region, 0.0) + row["amount"]
+    
+    total = sum(region_totals.values())
+    regions = [
+        {"region": k, "total_cost": round(v, 2), "percentage": round(v / total * 100, 1) if total > 0 else 0.0}
+        for k, v in sorted(region_totals.items(), key=lambda x: x[1], reverse=True)
+    ]
+    
+    return {
+        "days": days,
+        "regions": regions,
+        "total": round(total, 2),
+        "source": "aws_cost_explorer",
+    }
+
+
+@app.get("/api/costs/trends/{server_id}")
+def get_cost_trends_endpoint(server_id: str, days: int = 30):
+    """Get cost trends for a specific server with actual vs estimated costs."""
+    user = get_current_user()
+    authorize_server(user, server_id, permission="view_costs")
+    
+    trends = get_cost_trends(server_id, days=days)
+    return trends
+
+
+@app.get("/api/costs/anomalies/{server_id}")
+def get_cost_anomalies_endpoint(server_id: str, days: int = 30):
+    """Get cost anomalies for a specific server."""
+    user = get_current_user()
+    authorize_server(user, server_id, permission="view_costs")
+    
+    anomalies = detect_cost_anomalies(server_id, days=days)
+    return {"server_id": server_id, "anomalies": anomalies, "count": len(anomalies)}
+
+
 @app.patch("/api/alerts/{alert_id}/resolve")
-def resolve_alert_endpoint(alert_id: str):
+def resolve_alert_endpoint(alert_id: str, user: AuthenticatedUser = Depends(get_current_user)):
     """Mark an alert as resolved."""
-    result = resolve_alert(alert_id)
+    org_id, _role = resolve_org_for_user(user, None, permission="manage_alerts")
+    result = resolve_alert(alert_id, org_id=org_id)
+    if not result:
+        raise HTTPException(404, detail=f"Alert {alert_id} not found")
+    return result
     if not result:
         raise HTTPException(404, detail=f"Alert {alert_id} not found")
     return result
 
 
 @app.put("/api/servers/{server_id}/status")
-def update_server_status_endpoint(server_id: str, body: ServerStatusUpdate):
+def update_server_status_endpoint(
+    server_id: str,
+    body: ServerStatusUpdate,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
     """Update a server's operational status."""
-    server = get_server(server_id)
-    if not server:
-        raise HTTPException(404, detail=f"Server {server_id} not found")
+    server = authorize_server(user, server_id, permission="manage_resources")
     result = update_server_status(server_id, body.status)
     if not result:
         raise HTTPException(500, detail="Failed to update server status")
+    
+    # Audit log status change
+    try:
+        log_audit_event(
+            organization_id=server.get("organization_id") or "00000000-0000-0000-0000-000000000000",
+            action=AuditActions.NODE_STATUS_UPDATED if hasattr(AuditActions, "NODE_STATUS_UPDATED") else "NODE_STATUS_UPDATED",
+            resource_type="server",
+            actor_id=user.user_id,
+            resource_id=server_id,
+            metadata={"server_name": server.get("server_name"), "new_status": body.status},
+        )
+    except Exception:
+        pass
+
     return result
+
+
+@app.delete("/api/servers/{server_id}", response_model=ServerTerminateResponse)
+@app.post("/api/servers/{server_id}/terminate", response_model=ServerTerminateResponse)
+def terminate_server_endpoint(
+    server_id: str,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Terminate and permanently remove a node from fleet management.
+    
+    1. Validates server existence.
+    2. Enforces tenant authorization via JWT + RBAC.
+    3. If AWS EC2 node with active connection, attempts AWS instance termination safely.
+    4. Deletes/deactivates the node in persistent storage (cascading child telemetry).
+    5. Records an audit log event.
+    """
+    server = authorize_server(user, server_id, permission="manage_resources")
+    server_name = server.get("server_name", f"node-{server_id[:8]}")
+    prev_status = server.get("status", "active")
+    aws_instance_id = server.get("aws_instance_id")
+    source = server.get("source", "agent")
+    details: dict = {"previous_status": prev_status, "source": source}
+
+    # If AWS EC2 node, attempt termination via AWS credentials if available
+    if source == "aws_discovery" and aws_instance_id:
+        try:
+            conn_id = server.get("aws_connection_id")
+            conn = get_aws_connection(conn_id) if conn_id else None
+            region = server.get("aws_region") or "us-east-1"
+            if conn and conn.get("credentials"):
+                import boto3
+                creds = conn["credentials"]
+                ec2 = boto3.client(
+                    "ec2",
+                    region_name=region,
+                    aws_access_key_id=creds.get("access_key_id"),
+                    aws_secret_access_key=creds.get("secret_access_key"),
+                    aws_session_token=creds.get("session_token"),
+                )
+                ec2.terminate_instances(InstanceIds=[aws_instance_id])
+                details["aws_terminated"] = True
+        except Exception as aws_err:
+            details["aws_warning"] = str(aws_err)
+
+    # Delete from database (cascades child tables)
+    deleted = delete_server(server_id)
+    if not deleted:
+        raise HTTPException(status_code=500, detail="Failed to terminate and delete server from persistent storage")
+
+    # Record Audit Log
+    try:
+        log_audit_event(
+            organization_id=server.get("organization_id") or "00000000-0000-0000-0000-000000000000",
+            action=AuditActions.NODE_TERMINATED if hasattr(AuditActions, "NODE_TERMINATED") else "NODE_TERMINATED",
+            resource_type="server",
+            actor_id=user.user_id,
+            actor_email=user.email,
+            resource_id=server_id,
+            metadata={
+                "server_name": server_name,
+                "previous_status": prev_status,
+                "resulting_status": "terminated",
+                "source": source,
+                "aws_instance_id": aws_instance_id,
+                "details": details,
+            },
+        )
+    except Exception:
+        pass
+
+    return ServerTerminateResponse(
+        status="terminated",
+        server_id=server_id,
+        server_name=server_name,
+        message=f"Node '{server_name}' successfully terminated and removed from fleet inventory.",
+        details=details,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1072,13 +1353,16 @@ def get_anomalies(
     severity: Optional[str] = None,
     resolved: Optional[bool] = False,
     limit: int = 50,
+    user: AuthenticatedUser = Depends(get_current_user),
 ):
     """List anomaly events, optionally filtered by server, severity, and resolution status."""
+    org_id, _role = resolve_org_for_user(user, None, permission="view_anomalies")
     return list_anomaly_events(
         server_id=server_id,
         severity=severity,
         resolved=resolved,
         limit=limit,
+        org_id=org_id,
     )
 
 
@@ -1087,28 +1371,39 @@ def get_all_anomaly_events(
     server_id: Optional[str] = None,
     severity: Optional[str] = None,
     limit: int = 100,
+    user: AuthenticatedUser = Depends(get_current_user),
 ):
     """Fetch complete historical log of anomaly events."""
+    org_id, _role = resolve_org_for_user(user, None, permission="view_anomalies")
     return list_anomaly_events(
         server_id=server_id,
         severity=severity,
         resolved=None,
         limit=limit,
+        org_id=org_id,
     )
 
 
 @app.patch("/api/anomalies/{event_id}/resolve")
-def resolve_anomaly_event_endpoint(event_id: str):
+def resolve_anomaly_event_endpoint(
+    event_id: str,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
     """Mark an anomaly event as resolved."""
-    result = resolve_anomaly_event(event_id)
+    org_id, _role = resolve_org_for_user(user, None, permission="manage_anomalies")
+    result = resolve_anomaly_event(event_id, org_id=org_id)
     if not result:
         raise HTTPException(404, detail=f"Anomaly event {event_id} not found")
     return result
 
 
 @app.get("/api/anomalies/baseline/{server_id}")
-def get_server_baseline_envelopes(server_id: str):
+def get_server_baseline_envelopes(
+    server_id: str,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
     """Return historical baseline statistics (rolling & time-aware) and expected envelopes."""
+    authorize_server(user, server_id, permission="view_anomalies")
     server = get_server(server_id)
     if not server:
         raise HTTPException(404, detail=f"Server {server_id} not found")
@@ -1157,9 +1452,10 @@ def get_server_baseline_envelopes(server_id: str):
 # ---------------------------------------------------------------------------
 
 @app.get("/api/optimization/summary", response_model=OptimizationSummaryOut)
-def get_optimization_summary():
+def get_optimization_summary(user: AuthenticatedUser = Depends(get_current_user)):
     """Return aggregated cloud cost savings summary, top waste, and opportunity counts."""
-    servers = list_servers()
+    org_id, _role = resolve_org_for_user(user, None, permission="view_optimization")
+    servers = list_servers_for_org(org_id=org_id)
     metrics_by_server: dict[str, list[dict]] = {}
     costs_by_server: dict[str, list[dict]] = {}
 
@@ -1181,10 +1477,13 @@ def get_optimization_recommendations(
     recommendation_type: Optional[str] = None,
     status: Optional[str] = "active",
     limit: int = 50,
+    user: AuthenticatedUser = Depends(get_current_user),
 ):
     """List optimization recommendations filtered by resource, service, region, severity, or type."""
+    org_id, _role = resolve_org_for_user(user, None, permission="view_optimization")
     # First query existing stored recommendations
     stored = list_optimization_recommendations(
+        org_id=org_id,
         server_id=server_id,
         service_name=service_name,
         region=region,
@@ -1197,7 +1496,7 @@ def get_optimization_recommendations(
         return stored
 
     # If table is empty, run live rule-based analysis and persist
-    servers = list_servers()
+    servers = list_servers_for_org(org_id=org_id)
     metrics_by_server = {s["id"]: latest_metrics(s["id"], limit=30) for s in servers}
     costs_by_server = {s["id"]: get_daily_costs(server_id=s["id"], days=30) for s in servers}
 
@@ -1205,6 +1504,7 @@ def get_optimization_recommendations(
     if recs:
         upsert_optimization_recommendations(recs)
         return list_optimization_recommendations(
+            org_id=org_id,
             server_id=server_id,
             service_name=service_name,
             region=region,
@@ -1217,9 +1517,10 @@ def get_optimization_recommendations(
 
 
 @app.post("/api/optimization/analyze", response_model=OptimizationAnalyzeResult)
-def trigger_optimization_analysis():
+def trigger_optimization_analysis(user: AuthenticatedUser = Depends(get_current_user)):
     """Trigger cost optimization engine analysis on all resources and update recommendations."""
-    servers = list_servers()
+    org_id, _role = resolve_org_for_user(user, None, permission="manage_optimization")
+    servers = list_servers_for_org(org_id=org_id)
     metrics_by_server: dict[str, list[dict]] = {}
     costs_by_server: dict[str, list[dict]] = {}
 
@@ -1278,9 +1579,11 @@ def trigger_optimization_analysis():
 def update_recommendation_status_endpoint(
     recommendation_id: str,
     payload: RecommendationStatusUpdate = Body(...),
+    user: AuthenticatedUser = Depends(get_current_user),
 ):
     """Update recommendation status (active, applied, or dismissed)."""
-    updated = update_optimization_recommendation_status(recommendation_id, payload.status)
+    org_id, _role = resolve_org_for_user(user, None, permission="manage_optimization")
+    updated = update_optimization_recommendation_status(recommendation_id, payload.status, org_id=org_id)
     if not updated:
         raise HTTPException(404, detail=f"Recommendation {recommendation_id} not found")
     return updated
@@ -1291,17 +1594,29 @@ def update_recommendation_status_endpoint(
 # ---------------------------------------------------------------------------
 
 @app.get("/api/incidents", response_model=list[IncidentOut])
-def get_incidents(status: Optional[str] = None, limit: int = 50):
+def get_incidents(
+    status: Optional[str] = None,
+    limit: int = 50,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
     """List operational incidents with optional status filter ('open', 'acknowledged', 'resolved')."""
-    return list_incidents(status_filter=status, limit=limit)
+    org_id, _role = resolve_org_for_user(user, None, permission="view_incidents")
+    return list_incidents(org_id=org_id, status_filter=status, limit=limit)
 
 
 @app.get("/api/incidents/{incident_id}", response_model=IncidentOut)
-def get_incident_detail(incident_id: str):
+def get_incident_detail(
+    incident_id: str,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
     """Get single incident with full details, chronological timeline, and notes."""
     inc = get_incident(incident_id)
     if not inc:
         raise HTTPException(404, detail=f"Incident {incident_id} not found")
+    # Verify the incident belongs to the user's org
+    org_id, _role = resolve_org_for_user(user, None, permission="view_incidents")
+    if inc.get("organization_id") and inc["organization_id"] != org_id:
+        raise AuthorizationError("Access denied to this incident")
     inc["timeline"] = list_incident_timeline(incident_id)
     inc["notes"] = list_incident_notes(incident_id)
     return inc
@@ -1311,18 +1626,15 @@ def get_incident_detail(incident_id: str):
 def update_incident_status_endpoint(
     incident_id: str,
     payload: IncidentStatusUpdate = Body(...),
+    user: AuthenticatedUser = Depends(get_current_user),
 ):
     """Transition incident status (open -> acknowledged -> resolved) and record timeline event."""
     inc = get_incident(incident_id)
     if not inc:
         raise HTTPException(404, detail=f"Incident {incident_id} not found")
-
-    current_status = inc.get("status", "open")
-    if not validate_status_transition(current_status, payload.status):
-        raise HTTPException(
-            400,
-            detail=f"Invalid status transition from '{current_status}' to '{payload.status}'",
-        )
+    org_id, _role = resolve_org_for_user(user, None, permission="manage_incidents")
+    if inc.get("organization_id") and inc["organization_id"] != org_id:
+        raise AuthorizationError("Access denied to this incident")
 
     updated = update_incident_status(
         incident_id=incident_id,
@@ -1354,11 +1666,15 @@ def update_incident_status_endpoint(
 def add_incident_note(
     incident_id: str,
     payload: IncidentNoteCreate = Body(...),
+    user: AuthenticatedUser = Depends(get_current_user),
 ):
     """Add an operator note to an incident and record in timeline."""
+    org_id, _role = resolve_org_for_user(user, None, permission="manage_incidents")
     inc = get_incident(incident_id)
     if not inc:
         raise HTTPException(404, detail=f"Incident {incident_id} not found")
+    if inc.get("organization_id") and inc["organization_id"] != org_id:
+        raise AuthorizationError("Access denied to this incident")
 
     note = insert_incident_note({
         "incident_id": incident_id,
@@ -1380,11 +1696,14 @@ def add_incident_note(
 
 
 @app.post("/api/incidents/{incident_id}/investigate", response_model=AIInvestigationOut)
-def run_incident_ai_investigation(incident_id: str):
+def run_incident_ai_investigation(incident_id: str, user: AuthenticatedUser = Depends(get_current_user)):
     """Run grounded AI investigation for an incident using strictly verified backend facts."""
+    org_id, _role = resolve_org_for_user(user, None, permission="view_incidents")
     inc = get_incident(incident_id)
     if not inc:
         raise HTTPException(404, detail=f"Incident {incident_id} not found")
+    if inc.get("organization_id") and inc["organization_id"] != org_id:
+        raise AuthorizationError("Access denied to this incident")
 
     server_id = str(inc.get("server_id", ""))
     server = get_server(server_id) if server_id else None

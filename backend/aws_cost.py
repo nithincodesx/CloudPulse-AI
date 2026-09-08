@@ -226,3 +226,146 @@ def detect_budget_spikes(server_id: str, days: int = 14, threshold_mult: float =
     if mean <= 0:
         return False
     return amounts[-1] > threshold_mult * mean
+
+
+# ---------------------------------------------------------------------------
+# Cost Intelligence: Account, Service, Region, Trends
+# ---------------------------------------------------------------------------
+
+
+def fetch_region_breakdown(days_back: int = 14, connection: Optional[dict[str, Any]] = None) -> list[dict]:
+    """Pull daily UnblendedCost grouped by AWS region.
+
+    Returns [{region, date, amount}] — used for region cost analysis.
+    """
+    ce = get_ce_client(connection=connection)
+    resp = ce.get_cost_and_usage(
+        TimePeriod=_time_period(days_back),
+        Granularity="DAILY",
+        Metrics=["UnblendedCost"],
+        GroupBy=[{"Type": "DIMENSION", "Key": "REGION"}],
+    )
+
+    rows: list[dict] = []
+    for day in resp.get("ResultsByTime", []):
+        day_str = day["TimePeriod"]["Start"]
+        for group in day.get("Groups", []):
+            region = group.get("Keys", [""])[0]
+            amount = float(group.get("Metrics", {}).get("UnblendedCost", {}).get("Amount", 0.0))
+            rows.append({"region": region, "date": day_str, "amount": amount})
+    return rows
+
+
+def fetch_account_breakdown(days_back: int = 14, connection: Optional[dict[str, Any]] = None) -> list[dict]:
+    """Pull daily UnblendedCost grouped by AWS account (for organizations with multiple accounts).
+
+    Returns [{account_id, date, amount}] — used for multi-account cost analysis.
+    """
+    ce = get_ce_client(connection=connection)
+    resp = ce.get_cost_and_usage(
+        TimePeriod=_time_period(days_back),
+        Granularity="DAILY",
+        Metrics=["UnblendedCost"],
+        GroupBy=[{"Type": "DIMENSION", "Key": "LINKED_ACCOUNT"}],
+    )
+
+    rows: list[dict] = []
+    for day in resp.get("ResultsByTime", []):
+        day_str = day["TimePeriod"]["Start"]
+        for group in day.get("Groups", []):
+            account = group.get("Keys", [""])[0]
+            amount = float(group.get("Metrics", {}).get("UnblendedCost", {}).get("Amount", 0.0))
+            rows.append({"account_id": account, "date": day_str, "amount": amount})
+    return rows
+
+
+def get_cost_trends(server_id: str, days: int = 30) -> dict[str, Any]:
+    """Compute cost trends for a server: daily, monthly, actual vs estimated.
+
+    Returns structured trend data with clear labeling of actual vs estimated costs.
+    """
+    costs = get_daily_costs(server_id=server_id, days=days)
+    if not costs:
+        return {
+            "server_id": server_id,
+            "days_analyzed": 0,
+            "daily_costs": [],
+            "monthly_actual": 0.0,
+            "monthly_estimated": 0.0,
+            "trend_direction": "stable",
+            "cost_source": "none",
+        }
+
+    amounts = [float(c.get("amount", 0.0)) for c in costs]
+    dates = [c.get("date", "") for c in costs]
+
+    # Actual cost from AWS Cost Explorer
+    monthly_actual = round(sum(amounts), 2)
+
+    # Trend direction: compare first half vs second half
+    mid = len(amounts) // 2
+    if mid > 0:
+        first_half_avg = sum(amounts[:mid]) / mid
+        second_half_avg = sum(amounts[mid:]) / (len(amounts) - mid)
+        if second_half_avg > first_half_avg * 1.2:
+            trend = "increasing"
+        elif second_half_avg < first_half_avg * 0.8:
+            trend = "decreasing"
+        else:
+            trend = "stable"
+    else:
+        trend = "stable"
+
+    # Determine cost source
+    cost_source = "aws_cost_explorer" if costs and costs[0].get("source") == "aws_cost_explorer" else "estimated"
+
+    return {
+        "server_id": server_id,
+        "days_analyzed": len(amounts),
+        "daily_costs": [{"date": d, "amount": a} for d, a in zip(dates, amounts)],
+        "monthly_actual": monthly_actual,
+        "monthly_estimated": monthly_actual,  # Same as actual when from Cost Explorer
+        "trend_direction": trend,
+        "cost_source": cost_source,
+    }
+
+
+def detect_cost_anomalies(server_id: str, days: int = 14, z_threshold: float = 2.5) -> list[dict]:
+    """Detect cost anomalies using statistical methods on daily cost data.
+
+    Returns list of anomaly events with severity, deviation, and evidence.
+    """
+    costs = get_daily_costs(server_id=server_id, days=days)
+    if len(costs) < 7:
+        return []
+
+    amounts = [float(c.get("amount", 0.0)) for c in costs if c.get("amount") is not None]
+    if len(amounts) < 7:
+        return []
+
+    # Calculate mean and std
+    mean = sum(amounts) / len(amounts)
+    if mean < 0.01:
+        return []
+
+    variance = sum((x - mean) ** 2 for x in amounts) / len(amounts)
+    std = variance ** 0.5
+
+    if std < 0.01:
+        return []
+
+    anomalies = []
+    for i, (cost, amount) in enumerate(zip(costs, amounts)):
+        z = (amount - mean) / std
+        if abs(z) >= z_threshold:
+            severity = "critical" if abs(z) >= 4.0 else "warning"
+            anomalies.append({
+                "date": cost.get("date", ""),
+                "amount": amount,
+                "baseline_avg": round(mean, 2),
+                "deviation_sigma": round(z, 2),
+                "severity": severity,
+                "direction": "spike" if z > 0 else "drop",
+            })
+
+    return anomalies

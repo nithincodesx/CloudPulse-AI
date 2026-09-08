@@ -50,15 +50,22 @@ class ServerOut(BaseModel):
     id: UUID
     server_name: str
     ip_address: str | None = None
+    private_ip: str | None = None
+    public_ip: str | None = None
     status: str = "active"
     specifications: dict | None = None
     source: str = "agent"  # "agent" | "aws_discovery"
+    resource_type: str = "ec2"
     aws_instance_id: str | None = None
+    aws_resource_id: str | None = None
     aws_region: str | None = None
     aws_availability_zone: str | None = None
     aws_state: str | None = None
     aws_launch_time: datetime | None = None
     aws_tags: dict | None = None
+    aws_account_id: str | None = None
+    aws_connection_id: UUID | None = None
+    organization_id: UUID | None = None
     last_discovered_at: datetime | None = None
     created_at: datetime | None = None
 
@@ -114,7 +121,7 @@ class DiscoveryResult(BaseModel):
 # ---------------------------------------------------------------------------
 
 class ServerStatusUpdate(BaseModel):
-    status: str = Field(..., pattern=r"^(active|warning|critical|idle)$")
+    status: str = Field(..., pattern=r"^(active|warning|critical|idle|terminating|terminated)$")
 
 
 # ---------------------------------------------------------------------------
@@ -565,3 +572,11 @@ SyncEngineResult.model_rebuild()
 
 
 
+
+
+class ServerTerminateResponse(BaseModel):
+    status: str = "terminated"
+    server_id: UUID
+    server_name: str
+    message: str
+    details: dict | None = None

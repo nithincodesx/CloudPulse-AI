@@ -10,6 +10,7 @@ import {
   PowerOff,
   Cloud,
   Disc,
+  Loader2,
 } from "lucide-react";
 
 interface MetricRow {
@@ -26,7 +27,7 @@ interface ServerRow {
   id: string;
   server_name: string;
   ip_address?: string;
-  status: "active" | "warning" | "critical" | "idle";
+  status: "active" | "warning" | "critical" | "idle" | "pending" | "stale" | "terminating" | "terminated";
   specifications?: {
     vcpus?: number;
     ram_gb?: number;
@@ -47,6 +48,7 @@ interface ServerTableProps {
   servers: ServerRow[];
   onAction?: (serverId: string, action: "optimize" | "terminate") => void;
   onRowClick?: (serverId: string) => void;
+  terminatingId?: string | null;
 }
 
 const statusMeta: Record<
@@ -57,6 +59,7 @@ const statusMeta: Record<
   warning:  { label: "Warning",  color: "#ffe600", dotColor: "#ffe600" },
   critical: { label: "Critical", color: "#e8462c", dotColor: "#e8462c" },
   idle:     { label: "Idle",     color: "#8a8780", dotColor: "#6b6960" },
+  pending:  { label: "Awaiting Telemetry", color: "#6366f1", dotColor: "#6366f1" },
 };
 
 function projectedSavings(monthlyCost: number): number {
@@ -75,7 +78,7 @@ function MetricBar({ value, color }: { value: number; color: string }) {
   );
 }
 
-export default function ServerTable({ servers, onAction, onRowClick }: ServerTableProps) {
+export default function ServerTable({ servers, onAction, onRowClick, terminatingId }: ServerTableProps) {
   const totalSavings = servers
     .filter((s) => (s.status === "idle" || s.status === "warning") && s.monthly_cost != null)
     .reduce((acc, s) => acc + projectedSavings(s.monthly_cost ?? 0), 0);
@@ -321,41 +324,52 @@ export default function ServerTable({ servers, onAction, onRowClick }: ServerTab
 
                   {/* Action */}
                   <td className="px-5 py-4 text-right">
-                    {s.status === "warning" && onAction && (
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          onAction(s.id, "optimize");
-                        }}
-                        className="inline-flex items-center gap-1.5 rounded-xl px-3 py-1.5 text-[11px] font-mono font-semibold tracking-wider uppercase transition-all cursor-pointer"
-                        style={{
-                          background: "rgba(244,240,230,0.04)",
-                          color: "rgba(244,240,230,0.5)",
-                          border: "1px solid rgba(244,240,230,0.08)",
-                        }}
-                      >
-                        <Settings size={13} /> Optimize
-                      </button>
-                    )}
-                    {s.status === "idle" && onAction && (
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          onAction(s.id, "terminate");
-                        }}
-                        className="inline-flex items-center gap-1.5 rounded-xl px-3 py-1.5 text-[11px] font-mono font-semibold tracking-wider uppercase transition-all cursor-pointer"
-                        style={{
-                          background: "rgba(244,240,230,0.04)",
-                          color: "rgba(244,240,230,0.5)",
-                          border: "1px solid rgba(244,240,230,0.08)",
-                        }}
-                      >
-                        <PowerOff size={13} /> Terminate
-                      </button>
-                    )}
-                    {s.status !== "warning" && s.status !== "idle" && (
-                      <span className="text-[11px]" style={{ color: "rgba(244,240,230,0.15)" }}>—</span>
-                    )}
+                    <div className="flex items-center justify-end gap-2" onClick={(e) => e.stopPropagation()}>
+                      {s.status === "warning" && onAction && (
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onAction(s.id, "optimize");
+                          }}
+                          className="inline-flex items-center gap-1.5 rounded-xl px-3 py-1.5 text-[11px] font-mono font-semibold tracking-wider uppercase transition-all cursor-pointer hover:bg-yellow-500/10 hover:text-yellow-400"
+                          style={{
+                            background: "rgba(244,240,230,0.04)",
+                            color: "rgba(244,240,230,0.5)",
+                            border: "1px solid rgba(244,240,230,0.08)",
+                          }}
+                        >
+                          <Settings size={13} /> Optimize
+                        </button>
+                      )}
+                      {onAction && (
+                        <button
+                          disabled={terminatingId === s.id}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onAction(s.id, "terminate");
+                          }}
+                          className="inline-flex items-center gap-1.5 rounded-xl px-3 py-1.5 text-[11px] font-mono font-semibold tracking-wider uppercase transition-all cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed hover:bg-red-500/15 hover:text-red-400 hover:border-red-500/30"
+                          style={{
+                            background: "rgba(244,240,230,0.04)",
+                            color: "rgba(244,240,230,0.6)",
+                            border: "1px solid rgba(244,240,230,0.08)",
+                          }}
+                          title={`Terminate node ${s.server_name}`}
+                        >
+                          {terminatingId === s.id ? (
+                            <>
+                              <Loader2 size={13} className="animate-spin text-red-400" />
+                              <span className="text-red-400">Terminating...</span>
+                            </>
+                          ) : (
+                            <>
+                              <PowerOff size={13} />
+                              <span>Terminate</span>
+                            </>
+                          )}
+                        </button>
+                      )}
+                    </div>
                   </td>
                 </tr>
               );
@@ -377,6 +391,9 @@ export default function ServerTable({ servers, onAction, onRowClick }: ServerTab
           </div>
           <p className="text-sm font-medium" style={{ color: "rgba(244,240,230,0.35)" }}>
             No servers registered
+          </p>
+          <p className="text-[11px] font-mono mt-1" style={{ color: "rgba(244,240,230,0.2)" }}>
+            Provision your first node using the button above
           </p>
         </div>
       )}

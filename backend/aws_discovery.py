@@ -1,7 +1,7 @@
 """AWS Resource Discovery Service for CloudPulse AI.
 
-Provides modular discovery of AWS infrastructure (starting with EC2) and
-integrates discovered instances idempotently into the CloudPulse server model.
+Provides modular discovery of AWS infrastructure (EC2, RDS, ECS, Lambda, EBS, ELB) and
+integrates discovered instances idempotently into the CloudPulse server inventory model.
 
 Supports Multi-Tenant cross-account AssumeRole connections as well as
 local developer .env fallback.
@@ -12,11 +12,11 @@ from __future__ import annotations
 import os
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional, Type
 
 from dotenv import load_dotenv
 
-from aws_credentials import get_aws_client
+from aws_credentials import extract_account_id_from_arn, get_aws_client
 from database import (
     get_server_by_aws_instance_id,
     list_servers,
@@ -52,17 +52,14 @@ def discovery_configured(connection: Optional[dict[str, Any]] = None) -> bool:
     return bool(AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY)
 
 
+# ---------------------------------------------------------------------------
+# Modular Resource Discoverer Base Class & Registry
+# ---------------------------------------------------------------------------
+
 class ResourceDiscoverer(ABC):
-    """Abstract base class for AWS resource discovery services."""
+    """Abstract base class for AWS resource discovery providers."""
 
-    @abstractmethod
-    def discover(self, region: str | None = None) -> list[dict[str, Any]]:
-        """Discover resources and return normalized metadata dictionaries."""
-        pass
-
-
-class EC2Discoverer(ResourceDiscoverer):
-    """AWS EC2 instance discovery provider."""
+    service_name: str = "base"
 
     def __init__(
         self,
@@ -71,6 +68,45 @@ class EC2Discoverer(ResourceDiscoverer):
     ) -> None:
         self.connection = connection
         self.region = region or (connection.get("region") if connection else None) or AWS_REGION
+        self.account_id = (
+            (connection.get("aws_account_id") or extract_account_id_from_arn(connection.get("role_arn", "")))
+            if connection else None
+        ) or "unknown-account" 
+        self.org_id = connection.get("organization_id") if connection else None
+        self.conn_id = connection.get("id") if connection else None
+
+    @abstractmethod
+    def discover(self, region: str | None = None) -> list[dict[str, Any]]:
+        """Discover resources and return normalized metadata dictionaries."""
+        pass
+
+
+class DiscoveryRegistry:
+    """Registry for pluggable AWS resource discoverers."""
+
+    _registry: Dict[str, Type[ResourceDiscoverer]] = {}
+
+    @classmethod
+    def register(cls, name: str, discoverer_cls: Type[ResourceDiscoverer]) -> None:
+        cls._registry[name] = discoverer_cls
+
+    @classmethod
+    def get(cls, name: str) -> Optional[Type[ResourceDiscoverer]]:
+        return cls._registry.get(name)
+
+    @classmethod
+    def list_services(cls) -> List[str]:
+        return list(cls._registry.keys())
+
+
+# ---------------------------------------------------------------------------
+# EC2 Resource Discoverer
+# ---------------------------------------------------------------------------
+
+class EC2Discoverer(ResourceDiscoverer):
+    """AWS EC2 instance discovery provider."""
+
+    service_name: str = "ec2"
 
     def _get_ec2_client(self):
         if not discovery_configured(self.connection):
@@ -85,7 +121,7 @@ class EC2Discoverer(ResourceDiscoverer):
             self.region = region
 
         client = self._get_ec2_client()
-        logger.info("aws.discovery.ec2.start", region=self.region)
+        logger.info("aws.discovery.ec2.start", region=self.region, account_id=self.account_id)
 
         try:
             paginator = client.get_paginator("describe_instances")
@@ -99,23 +135,23 @@ class EC2Discoverer(ResourceDiscoverer):
             )
 
             discovered_instances: list[dict[str, Any]] = []
-
             for page in page_iterator:
                 for reservation in page.get("Reservations", []):
+                    owner_id = reservation.get("OwnerId") or self.account_id
                     for instance in reservation.get("Instances", []):
-                        parsed = self._parse_instance(instance)
+                        parsed = self._parse_instance(instance, owner_account_id=owner_id)
                         if parsed:
                             discovered_instances.append(parsed)
 
             logger.info(
-                "aws.discovery.ec2.complete",
-                region=self.region,
+                "aws.discovery.ec2.success",
                 count=len(discovered_instances),
+                region=self.region,
             )
             return discovered_instances
 
         except ClientError as exc:
-            error_code = exc.response.get("Error", {}).get("Code", "ClientError")
+            error_code = exc.response.get("Error", {}).get("Code", "Unknown")
             error_msg = exc.response.get("Error", {}).get("Message", str(exc))
             logger.error(
                 "aws.discovery.ec2.client_error",
@@ -128,9 +164,25 @@ class EC2Discoverer(ResourceDiscoverer):
             logger.error("aws.discovery.ec2.botocore_error", error=str(exc))
             raise RuntimeError(f"AWS EC2 Discovery error: {exc}") from exc
 
-
-    def _parse_instance(self, instance: dict[str, Any]) -> dict[str, Any]:
-        """Normalize EC2 raw describe_instances item into CloudPulse metadata schema."""
+    def _parse_instance(self, instance: dict[str, Any], owner_account_id: str | None = None) -> dict[str, Any]:
+        """Normalize EC2 raw describe_instances item into CloudPulse metadata schema.
+        
+        Collects:
+        - instance ID (aws_instance_id / aws_resource_id)
+        - name (server_name)
+        - instance type (specifications.type)
+        - region (aws_region)
+        - availability zone (aws_availability_zone)
+        - state (aws_state)
+        - private IP (private_ip)
+        - public IP (public_ip)
+        - launch time (aws_launch_time)
+        - tags (aws_tags)
+        - account ID (aws_account_id)
+        - organization ID (organization_id)
+        - AWS connection ID (aws_connection_id)
+        - AWS resource ID (aws_resource_id)
+        """
         instance_id = instance.get("InstanceId", "")
         instance_type = instance.get("InstanceType", "unknown")
         state_dict = instance.get("State", {})
@@ -153,13 +205,15 @@ class EC2Discoverer(ResourceDiscoverer):
         # Name heuristic: Name tag -> instance_id
         name = tags.get("Name") or f"aws-{instance_id}"
 
-        # IP address heuristic: PublicIpAddress -> PrivateIpAddress -> "auto-assigned"
-        ip = instance.get("PublicIpAddress") or instance.get("PrivateIpAddress") or "auto-assigned"
+        # IP addresses (collected as network metadata, NOT used as primary identity)
+        private_ip = instance.get("PrivateIpAddress") or ""
+        public_ip = instance.get("PublicIpAddress") or ""
+        display_ip = public_ip or private_ip or "auto-assigned"
 
         architecture = instance.get("Architecture", "x86_64")
         hypervisor = instance.get("Hypervisor", "xen")
 
-        # Derive approximate vcpus and ram_gb from common EC2 sizing heuristics if not explicitly known
+        # Derive approximate vcpus and ram_gb
         vcpus, ram_gb = _approximate_instance_specs(instance_type)
 
         specifications = {
@@ -170,18 +224,198 @@ class EC2Discoverer(ResourceDiscoverer):
             "ram_gb": ram_gb,
         }
 
+        account_id = owner_account_id or self.account_id
+
         return {
             "aws_instance_id": instance_id,
+            "aws_resource_id": instance_id,
             "server_name": name,
-            "ip_address": ip,
+            "resource_type": "ec2",
+            "ip_address": display_ip,
+            "private_ip": private_ip,
+            "public_ip": public_ip,
             "aws_region": self.region,
             "aws_availability_zone": az,
             "aws_state": state_name,
             "aws_launch_time": launch_time_str,
             "aws_tags": tags,
+            "aws_account_id": account_id,
+            "organization_id": self.org_id,
+            "aws_connection_id": self.conn_id,
             "specifications": specifications,
         }
 
+
+# ---------------------------------------------------------------------------
+# Extensible Discovery Providers (RDS, ECS, Lambda, EBS, ELB)
+# ---------------------------------------------------------------------------
+
+class RDSDiscoverer(ResourceDiscoverer):
+    """AWS Relational Database Service (RDS) discovery provider."""
+    service_name: str = "rds"
+
+    def discover(self, region: str | None = None) -> list[dict[str, Any]]:
+        if region:
+            self.region = region
+        client = get_aws_client("rds", connection=self.connection, region=self.region)
+        try:
+            paginator = client.get_paginator("describe_db_instances")
+            instances = []
+            for page in paginator.paginate():
+                for db in page.get("DBInstances", []):
+                    db_id = db.get("DBInstanceIdentifier", "")
+                    instances.append({
+                        "aws_resource_id": db.get("DBInstanceArn", db_id),
+                        "server_name": db_id,
+                        "resource_type": "rds",
+                        "aws_region": self.region,
+                        "aws_state": db.get("DBInstanceStatus", "available"),
+                        "aws_account_id": self.account_id,
+                        "specifications": {
+                            "type": db.get("DBInstanceClass", "db.t3.medium"),
+                            "engine": db.get("Engine", "postgres"),
+                            "allocated_storage": db.get("AllocatedStorage", 20),
+                        },
+                    })
+            return instances
+        except Exception as exc:
+            logger.warning("aws.discovery.rds.skipped", error=str(exc))
+            return []
+
+
+class ECSDiscoverer(ResourceDiscoverer):
+    """AWS Elastic Container Service (ECS) discovery provider."""
+    service_name: str = "ecs"
+
+    def discover(self, region: str | None = None) -> list[dict[str, Any]]:
+        if region:
+            self.region = region
+        client = get_aws_client("ecs", connection=self.connection, region=self.region)
+        try:
+            clusters = client.list_clusters().get("clusterArns", [])
+            return [
+                {
+                    "aws_resource_id": arn,
+                    "server_name": arn.split("/")[-1],
+                    "resource_type": "ecs_cluster",
+                    "aws_region": self.region,
+                    "aws_account_id": self.account_id,
+                }
+                for arn in clusters
+            ]
+        except Exception as exc:
+            logger.warning("aws.discovery.ecs.skipped", error=str(exc))
+            return []
+
+
+class LambdaDiscoverer(ResourceDiscoverer):
+    """AWS Lambda serverless function discovery provider."""
+    service_name: str = "lambda"
+
+    def discover(self, region: str | None = None) -> list[dict[str, Any]]:
+        if region:
+            self.region = region
+        client = get_aws_client("lambda", connection=self.connection, region=self.region)
+        try:
+            paginator = client.get_paginator("list_functions")
+            functions = []
+            for page in paginator.paginate():
+                for fn in page.get("Functions", []):
+                    functions.append({
+                        "aws_resource_id": fn.get("FunctionArn"),
+                        "server_name": fn.get("FunctionName"),
+                        "resource_type": "lambda",
+                        "aws_region": self.region,
+                        "aws_account_id": self.account_id,
+                        "specifications": {
+                            "runtime": fn.get("Runtime"),
+                            "memory_size": fn.get("MemorySize"),
+                            "timeout": fn.get("Timeout"),
+                        },
+                    })
+            return functions
+        except Exception as exc:
+            logger.warning("aws.discovery.lambda.skipped", error=str(exc))
+            return []
+
+
+class EBSDiscoverer(ResourceDiscoverer):
+    """AWS Elastic Block Store (EBS) discovery provider."""
+    service_name: str = "ebs"
+
+    def discover(self, region: str | None = None) -> list[dict[str, Any]]:
+        if region:
+            self.region = region
+        client = get_aws_client("ec2", connection=self.connection, region=self.region)
+        try:
+            paginator = client.get_paginator("describe_volumes")
+            volumes = []
+            for page in paginator.paginate():
+                for vol in page.get("Volumes", []):
+                    vol_id = vol.get("VolumeId")
+                    volumes.append({
+                        "aws_resource_id": vol_id,
+                        "server_name": vol_id,
+                        "resource_type": "ebs_volume",
+                        "aws_region": self.region,
+                        "aws_state": vol.get("State"),
+                        "aws_account_id": self.account_id,
+                        "specifications": {
+                            "size_gb": vol.get("Size"),
+                            "volume_type": vol.get("VolumeType"),
+                            "iops": vol.get("Iops"),
+                        },
+                    })
+            return volumes
+        except Exception as exc:
+            logger.warning("aws.discovery.ebs.skipped", error=str(exc))
+            return []
+
+
+class ELBDiscoverer(ResourceDiscoverer):
+    """AWS Elastic Load Balancer (ELB / ALB / NLB) discovery provider."""
+    service_name: str = "elbv2"
+
+    def discover(self, region: str | None = None) -> list[dict[str, Any]]:
+        if region:
+            self.region = region
+        client = get_aws_client("elbv2", connection=self.connection, region=self.region)
+        try:
+            paginator = client.get_paginator("describe_load_balancers")
+            lbs = []
+            for page in paginator.paginate():
+                for lb in page.get("LoadBalancers", []):
+                    lbs.append({
+                        "aws_resource_id": lb.get("LoadBalancerArn"),
+                        "server_name": lb.get("LoadBalancerName"),
+                        "resource_type": "elb",
+                        "aws_region": self.region,
+                        "aws_state": lb.get("State", {}).get("Code", "active"),
+                        "aws_account_id": self.account_id,
+                        "specifications": {
+                            "type": lb.get("Type"),
+                            "scheme": lb.get("Scheme"),
+                            "dns_name": lb.get("DNSName"),
+                        },
+                    })
+            return lbs
+        except Exception as exc:
+            logger.warning("aws.discovery.elbv2.skipped", error=str(exc))
+            return []
+
+
+# Register providers in the global registry
+DiscoveryRegistry.register("ec2", EC2Discoverer)
+DiscoveryRegistry.register("rds", RDSDiscoverer)
+DiscoveryRegistry.register("ecs", ECSDiscoverer)
+DiscoveryRegistry.register("lambda", LambdaDiscoverer)
+DiscoveryRegistry.register("ebs", EBSDiscoverer)
+DiscoveryRegistry.register("elbv2", ELBDiscoverer)
+
+
+# ---------------------------------------------------------------------------
+# Helper Heuristics & Sizing
+# ---------------------------------------------------------------------------
 
 def _approximate_instance_specs(instance_type: str) -> tuple[int, int]:
     """Estimate vCPU and RAM from common instance type names."""
@@ -215,11 +449,79 @@ def _map_aws_state_to_status(aws_state: str) -> str:
     return "active"
 
 
+# ---------------------------------------------------------------------------
+# Resource Matching & Idempotent Synchronization Pipeline
+# ---------------------------------------------------------------------------
+
+def match_discovered_resource_to_telemetry_node(
+    item: dict[str, Any],
+    existing_servers: list[dict[str, Any]],
+) -> Optional[dict[str, Any]]:
+    """Match an AWS discovered resource to an existing CloudPulse telemetry node.
+    
+    HIERARCHY OF RELIABLE IDENTIFIERS:
+    1. AWS Instance ID / AWS Resource ID (exact, unique match)
+    2. AWS Account ID + Region + Explicit Tag/Node metadata (e.g. `cloudpulse:id`, `node_id`, `server`, `Name`)
+    3. Server name / cost tag exact match within same organization/account
+    
+    * IP address is NEVER used as the primary identity because cloud IPs change dynamically.
+    """
+    instance_id = item.get("aws_instance_id") or item.get("aws_resource_id")
+    account_id = item.get("aws_account_id")
+    region = item.get("aws_region")
+    tags = item.get("aws_tags", {})
+    name = item.get("server_name", "")
+
+    # Priority 1: Exact AWS Instance ID / AWS Resource ID match
+    if instance_id:
+        for s in existing_servers:
+            if s.get("aws_instance_id") == instance_id or s.get("aws_resource_id") == instance_id:
+                return s
+
+    # Priority 2: Dedicated CloudPulse node tag match (e.g. `cloudpulse:id`, `cloudpulse-node`, `node_id`)
+    cloudpulse_tag = tags.get("cloudpulse:id") or tags.get("node_id") or tags.get("cloudpulse-node")
+    if cloudpulse_tag:
+        want_tag = cloudpulse_tag.strip().lower()
+        for s in existing_servers:
+            if str(s.get("id", "")).lower() == want_tag or (s.get("server_name") or "").strip().lower() == want_tag:
+                return s
+
+    # Priority 3: AWS Account ID + Region + Cost Tag / Name match
+    cost_tag_val = tags.get(AWS_COST_TAG_KEY) or tags.get("server") or tags.get("Server") or name
+    if cost_tag_val:
+        want_val = cost_tag_val.strip().lower()
+        for s in existing_servers:
+            s_cost_tag = (s.get("cost_tag") or "").strip().lower()
+            s_name = (s.get("server_name") or "").strip().lower()
+            
+            # Account / region affinity check if available
+            s_acc = s.get("aws_account_id")
+            s_reg = s.get("aws_region")
+            if s_acc and account_id and s_acc != account_id:
+                continue
+            if s_reg and region and s_reg != region:
+                continue
+
+            if s_cost_tag and s_cost_tag == want_val:
+                return s
+            if s_name and s_name == want_val:
+                return s
+
+    return None
+
+
 def sync_aws_resources(
     region: str | None = None,
     connection: Optional[dict[str, Any]] = None,
 ) -> DiscoveryResult:
-    """Run AWS discovery across services and upsert servers into the database."""
+    """Run AWS discovery across services and upsert servers idempotently into the database.
+    
+    Guarantees:
+    - Never creates duplicate server records.
+    - Captures all 11 EC2 metadata fields.
+    - Associates with organization_id and aws_connection_id.
+    - Idempotent upsert behavior.
+    """
     if not discovery_configured(connection):
         return DiscoveryResult(error="AWS not configured — Connect an AWS account in the dashboard.")
 
@@ -239,56 +541,49 @@ def sync_aws_resources(
 
     now_iso = datetime.now(timezone.utc).isoformat()
     conn_id = connection.get("id") if connection else None
+    org_id = connection.get("organization_id") if connection else None
+    account_id = (
+        (connection.get("aws_account_id") or extract_account_id_from_arn(connection.get("role_arn", "")))
+        if connection else None
+    )
 
     for item in instances:
         instance_id = item["aws_instance_id"]
         instance_name = item["server_name"]
         tags = item.get("aws_tags", {})
-        ip_addr = item.get("ip_address")
 
-        # 1. Match by aws_instance_id
-        matched_server = get_server_by_aws_instance_id(instance_id)
-
-        # 2. If not matched, try matching existing server by cost_tag / name / IP
-        if not matched_server:
-            cost_tag_val = tags.get(AWS_COST_TAG_KEY) or tags.get("server") or tags.get("Server")
-            want_tags = [v.strip().lower() for v in [cost_tag_val, instance_name, ip_addr] if v]
-
-            for s in existing_servers:
-                s_cost_tag = (s.get("cost_tag") or "").strip().lower()
-                s_name = (s.get("server_name") or "").strip().lower()
-                s_ip = (s.get("ip_address") or "").strip().lower()
-
-                if s_cost_tag and s_cost_tag in want_tags:
-                    matched_server = s
-                    break
-                if s_name and s_name in want_tags:
-                    matched_server = s
-                    break
-                if s_ip and s_ip in want_tags:
-                    matched_server = s
-                    break
+        # Reliable identifier hierarchical matching
+        matched_server = match_discovered_resource_to_telemetry_node(item, existing_servers)
 
         status = _map_aws_state_to_status(item.get("aws_state", "running"))
 
         if matched_server:
             matched_count += 1
-            # Update existing server record
+            # Update existing server record idempotently
             payload = {
                 "id": matched_server["id"],
                 "server_name": matched_server.get("server_name") or instance_name,
                 "source": "aws_discovery",
+                "resource_type": "ec2",
                 "aws_instance_id": instance_id,
+                "aws_resource_id": instance_id,
                 "aws_region": item.get("aws_region"),
                 "aws_availability_zone": item.get("aws_availability_zone"),
                 "aws_state": item.get("aws_state"),
                 "aws_launch_time": item.get("aws_launch_time"),
                 "aws_tags": tags,
+                "aws_account_id": item.get("aws_account_id") or account_id,
                 "last_discovered_at": now_iso,
                 "status": status if matched_server.get("status") != "critical" else matched_server["status"],
             }
+            if org_id:
+                payload["organization_id"] = org_id
             if conn_id:
                 payload["aws_connection_id"] = conn_id
+            if item.get("private_ip"):
+                payload["private_ip"] = item["private_ip"]
+            if item.get("public_ip"):
+                payload["public_ip"] = item["public_ip"]
             if item.get("ip_address") and item["ip_address"] != "auto-assigned":
                 payload["ip_address"] = item["ip_address"]
 
@@ -299,20 +594,28 @@ def sync_aws_resources(
             payload = {
                 "server_name": instance_name,
                 "ip_address": item.get("ip_address"),
+                "private_ip": item.get("private_ip"),
+                "public_ip": item.get("public_ip"),
+                "resource_type": "ec2",
                 "status": status,
                 "specifications": item.get("specifications", {}),
                 "source": "aws_discovery",
                 "aws_instance_id": instance_id,
+                "aws_resource_id": instance_id,
                 "aws_region": item.get("aws_region"),
                 "aws_availability_zone": item.get("aws_availability_zone"),
                 "aws_state": item.get("aws_state"),
                 "aws_launch_time": item.get("aws_launch_time"),
                 "aws_tags": tags,
+                "aws_account_id": item.get("aws_account_id") or account_id,
                 "cost_tag": tags.get(AWS_COST_TAG_KEY) or instance_name,
                 "last_discovered_at": now_iso,
             }
+            if org_id:
+                payload["organization_id"] = org_id
             if conn_id:
                 payload["aws_connection_id"] = conn_id
+
             upsert_discovered_server(payload)
             created_count += 1
 

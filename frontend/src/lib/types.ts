@@ -2,9 +2,11 @@ export interface Server {
   id: string;
   server_name: string;
   ip_address?: string;
+  private_ip?: string;
+  public_ip?: string;
   ingestion_token?: string;
   cost_tag?: string;
-  status: "active" | "warning" | "critical" | "idle";
+  status: "active" | "warning" | "critical" | "idle" | "pending" | "terminating" | "terminated";
   specifications?: {
     vcpus?: number;
     ram_gb?: number;
@@ -13,12 +15,17 @@ export interface Server {
     hypervisor?: string;
   };
   source?: "agent" | "aws_discovery";
+  resource_type?: string;
   aws_instance_id?: string;
+  aws_resource_id?: string;
   aws_region?: string;
   aws_availability_zone?: string;
   aws_state?: string;
   aws_launch_time?: string;
   aws_tags?: Record<string, string>;
+  aws_account_id?: string;
+  aws_connection_id?: string;
+  organization_id?: string;
   last_discovered_at?: string;
   created_at?: string;
 }
@@ -475,3 +482,12 @@ export interface OrganizationUsage {
 
 
 
+
+
+export interface ServerTerminateResult {
+  status: string;
+  server_id: string;
+  server_name: string;
+  message: string;
+  details?: Record<string, unknown>;
+}

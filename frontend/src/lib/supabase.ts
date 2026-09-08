@@ -146,9 +146,13 @@ export async function generateInsight(): Promise<InsightGenerateResult> {
   return await res.json();
 }
 
-export async function updateServerStatus(serverId: string, status: string): Promise<boolean> {
+export async function updateServerStatus(serverId: string, status: string, userId?: string, orgId?: string): Promise<boolean> {
   try {
-    const res = await fetch(`${API_URL}/api/servers/${serverId}/status`, {
+    const params = new URLSearchParams();
+    if (userId) params.set("user_id", userId);
+    if (orgId) params.set("org_id", orgId);
+    const qs = params.toString() ? `?${params.toString()}` : "";
+    const res = await fetch(`${API_URL}/api/servers/${serverId}/status${qs}`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ status }),
@@ -157,6 +161,52 @@ export async function updateServerStatus(serverId: string, status: string): Prom
   } catch (error) {
     console.error("Failed to update server status", error);
     return false;
+  }
+}
+
+export async function terminateServer(
+  serverId: string,
+  userId?: string,
+  orgId?: string
+): Promise<{ success: boolean; error?: string }> {
+  let backendOk = false;
+  let backendErr: string | undefined;
+
+  // 1. Call Backend API endpoint
+  try {
+    const params = new URLSearchParams();
+    if (userId) params.set("user_id", userId);
+    if (orgId) params.set("org_id", orgId);
+    const qs = params.toString() ? `?${params.toString()}` : "";
+    const res = await fetch(`${API_URL}/api/servers/${serverId}${qs}`, {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+    });
+    if (res.ok) {
+      backendOk = true;
+    } else {
+      const errData = await res.json().catch(() => null);
+      backendErr = errData?.detail || `Backend returned HTTP ${res.status}`;
+    }
+  } catch (error: any) {
+    console.warn("Backend terminateServer endpoint unreachable, falling back to direct Supabase deletion:", error);
+    backendErr = error?.message;
+  }
+
+  // 2. Also execute direct Supabase deletion with authenticated user session
+  // (guarantees deletion persists even if backend service key is in restricted mode)
+  try {
+    const { error: supaErr } = await supabase.from("servers").delete().eq("id", serverId);
+    if (supaErr) {
+      console.warn("Direct Supabase delete warning:", supaErr);
+      if (!backendOk) {
+        return { success: false, error: supaErr.message || backendErr || "Failed to terminate server" };
+      }
+    }
+    return { success: true };
+  } catch (error: any) {
+    if (backendOk) return { success: true };
+    return { success: false, error: error?.message || backendErr || "Failed to terminate server" };
   }
 }
 

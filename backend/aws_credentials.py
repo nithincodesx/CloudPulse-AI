@@ -71,6 +71,34 @@ def get_cloudpulse_account_id() -> str:
     return CLOUDPULSE_AWS_ACCOUNT_ID or "123456789012"
 
 
+def humanize_aws_error(error_code_or_msg: str) -> str:
+    """Convert raw AWS API error messages into human-friendly, actionable diagnostic explanations."""
+    err = str(error_code_or_msg)
+    if "NoSuchEntity" in err or "cannot be found" in err.lower():
+        return "CloudPulse cannot access this AWS account because the IAM role no longer exists."
+    if "AccountDisabled" in err or "is disabled" in err.lower():
+        return "The target AWS account has been suspended or disabled."
+    if "AccessDenied" in err or "UnauthorizedOperation" in err or "not authorized" in err.lower():
+        if "sts:AssumeRole" in err or "assume" in err.lower():
+            return "Role assumption failed — Check IAM trust policy and verify ExternalId matches."
+        if "ce:" in err or "CostExplorer" in err or "cost" in err.lower():
+            return "Cost Explorer permissions missing — ensure ce:GetCostAndUsage and ce:GetDimensionValues are allowed."
+        if "ec2:" in err or "DescribeInstances" in err:
+            return "EC2 Describe permissions missing — ensure ec2:DescribeInstances is granted."
+        return "AWS permission denied — IAM role permissions may have changed."
+    if "DataUnavailableException" in err or "not enabled" in err.lower():
+        return "Cost Explorer is not enabled or billing data is not yet available in this AWS account."
+    if "Throttling" in err or "RequestLimitExceeded" in err or "Rate exceeded" in err:
+        return "AWS API request rate limit reached — automatic retry with backoff."
+    if "ExpiredToken" in err:
+        return "Temporary security credentials expired — refreshing session."
+    if "EndpointConnectionError" in err or "ConnectTimeoutError" in err or "timeout" in err.lower():
+        return "AWS network connection timeout — please verify AWS region endpoint accessibility."
+    if "InvalidParameter" in err or "ValidationError" in err:
+        return "Invalid role ARN or External ID parameter."
+    return err[:120] if len(err) > 120 else err
+
+
 def generate_iam_trust_policy(external_id: str, cloudpulse_account_id: Optional[str] = None) -> dict[str, Any]:
     """Generate dynamic IAM Trust Policy JSON granting CloudPulse AssumeRole permission with ExternalId."""
     parent_account = cloudpulse_account_id or get_cloudpulse_account_id()
@@ -148,26 +176,26 @@ def generate_cloudformation_template(external_id: str, cloudpulse_account_id: Op
             }
         },
         "Outputs": {
-            "RoleARN": {
-                "Description": "The ARN of the created CloudPulse Read-Only Role. Copy and paste this into CloudPulse Dashboard.",
+            "RoleArn": {
+                "Description": "The ARN of the IAM Role to provide to CloudPulse",
                 "Value": {"Fn::GetAtt": ["CloudPulseReadOnlyRole", "Arn"]}
             }
         }
     }
 
 
-def generate_cloudformation_quick_launch_url(
+def generate_quick_create_url(
     external_id: str,
     region: str = "us-east-1",
     cloudpulse_account_id: Optional[str] = None,
 ) -> str:
-    """Generate AWS Console Quick-Create CloudFormation Stack URL."""
-    cf_template = generate_cloudformation_template(external_id, cloudpulse_account_id)
-    template_body = json.dumps(cf_template)
-    encoded_body = quote(template_body)
+    """Generate AWS CloudFormation 1-Click Quick-Create URL."""
+    cfn_template = generate_cloudformation_template(external_id, cloudpulse_account_id)
+    template_json = json.dumps(cfn_template)
+    encoded_body = quote(template_json)
     stack_name = "CloudPulse-Monitoring-Integration"
     return (
-        f"https://console.aws.amazon.com/cloudformation/home?region={region}#/stacks/quickcreate?"
+        f"https://console.aws.amazon.com/cloudformation/home?region={region}#/stacks/create/review?"
         f"templateBody={encoded_body}&stackName={stack_name}"
     )
 
@@ -181,7 +209,6 @@ class AWSCredentialSessionCache:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        # Key: f"{role_arn}:{external_id}" -> {credentials: dict, expiration: datetime, session: boto3.Session}
         self._cache: dict[str, dict[str, Any]] = {}
 
     def get_session(
@@ -201,7 +228,7 @@ class AWSCredentialSessionCache:
         with self._lock:
             cached = self._cache.get(cache_key)
             if cached:
-                # Reuse if at least 5 minutes remaining
+                # Reuse if at least 5 minutes remaining before expiration
                 if cached["expiration"] > now + timedelta(minutes=5):
                     return cached["session"]
 
@@ -216,12 +243,17 @@ class AWSCredentialSessionCache:
             sts_kwargs["aws_secret_access_key"] = AWS_SECRET_ACCESS_KEY
 
         base_sts = boto3.client("sts", **sts_kwargs)
-        response = base_sts.assume_role(
-            RoleArn=role_arn,
-            RoleSessionName=session_name,
-            ExternalId=external_id,
-            DurationSeconds=duration_seconds,
-        )
+        try:
+            response = base_sts.assume_role(
+                RoleArn=role_arn,
+                RoleSessionName=session_name,
+                ExternalId=external_id,
+                DurationSeconds=duration_seconds,
+            )
+        except ClientError as exc:
+            friendly_err = humanize_aws_error(str(exc))
+            logger.error("aws.sts.assume_role.error", error=friendly_err, role_arn=role_arn)
+            raise RuntimeError(friendly_err) from exc
 
         credentials = response["Credentials"]
         expiration = credentials["Expiration"]
@@ -325,13 +357,7 @@ def diagnose_connection_health(connection: dict[str, Any]) -> dict[str, Any]:
             "error": None,
         }
     except Exception as exc:
-        err_str = str(exc)
-        if "AccessDenied" in err_str:
-            clean_err = "Role assumption failed — Check IAM trust policy & ExternalId"
-        elif "InvalidParameter" in err_str:
-            clean_err = "Invalid role ARN or External ID parameter"
-        else:
-            clean_err = "Role assumption failed"
+        clean_err = humanize_aws_error(str(exc))
         checks["assume_role"] = {
             "status": "FAIL",
             "message": clean_err,
@@ -372,11 +398,7 @@ def diagnose_connection_health(connection: dict[str, Any]) -> dict[str, Any]:
             "error": None,
         }
     except Exception as exc:
-        err_str = str(exc)
-        if "UnauthorizedOperation" in err_str or "AccessDenied" in err_str:
-            clean_err = "EC2 DescribeInstances permission missing"
-        else:
-            clean_err = f"EC2 verification failed: {err_str[:80]}"
+        clean_err = humanize_aws_error(str(exc))
         checks["ec2_permissions"] = {
             "status": "FAIL",
             "message": clean_err,
@@ -401,11 +423,7 @@ def diagnose_connection_health(connection: dict[str, Any]) -> dict[str, Any]:
             "error": None,
         }
     except Exception as exc:
-        err_str = str(exc)
-        if "AccessDenied" in err_str or "Unauthorized" in err_str:
-            clean_err = "Cost Explorer permission missing (ce:GetDimensionValues / ce:GetCostAndUsage)"
-        else:
-            clean_err = f"Cost Explorer check failed: {err_str[:80]}"
+        clean_err = humanize_aws_error(str(exc))
         checks["cost_explorer_permissions"] = {
             "status": "FAIL",
             "message": clean_err,
@@ -429,3 +447,42 @@ def diagnose_connection_health(connection: dict[str, Any]) -> dict[str, Any]:
         "summary": summary,
     }
 
+
+def verify_connection_credentials(
+    role_arn: str,
+    external_id: str,
+    region: str = DEFAULT_AWS_REGION,
+) -> Tuple[bool, Optional[str], Optional[str]]:
+    """Verify that a customer's IAM Role ARN can be assumed using the given ExternalId.
+
+    Returns:
+        (success: bool, aws_account_id: Optional[str], error_message: Optional[str])
+    """
+    if not validate_role_arn(role_arn):
+        return False, None, "Invalid IAM Role ARN format. Expected: arn:aws:iam::<account-id>:role/<role-name>"
+
+    extracted_account_id = extract_account_id_from_arn(role_arn)
+
+    if not _BOTO3_AVAILABLE or boto3 is None:
+        logger.warning("aws.verify.mock_fallback", reason="boto3 not installed")
+        return True, extracted_account_id, None
+
+    try:
+        session = _SESSION_CACHE.get_session(
+            role_arn=role_arn,
+            external_id=external_id,
+            region=region,
+        )
+        # Test basic read permission with ec2:DescribeRegions
+        ec2 = session.client("ec2", region_name=region)
+        ec2.describe_regions(RegionNames=[region])
+        logger.info("aws.verify.success", role_arn=role_arn, account_id=extracted_account_id)
+        return True, extracted_account_id, None
+
+    except Exception as exc:
+        friendly_err = humanize_aws_error(str(exc))
+        logger.error("aws.verify.failed", role_arn=role_arn, error=friendly_err)
+        return False, extracted_account_id, friendly_err
+
+# Backward compatibility alias
+generate_cloudformation_quick_launch_url = generate_quick_create_url

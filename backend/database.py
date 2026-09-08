@@ -10,6 +10,7 @@ anon-key access by the frontend. The service key never leaves the backend.
 """
 
 import os
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
@@ -43,21 +44,92 @@ except Exception as exc:
     ) from exc
 
 
+def _jwt_role(key: str) -> Optional[str]:
+    """Best-effort decode of the ``role`` claim from a Supabase JWT.
+
+    Supabase keys are signed JWTs; we only read the payload to detect a
+    misconfigured key (anon vs service_role). No signature verification —
+    this is a diagnostic, not an auth decision.
+    """
+    try:
+        import base64
+        import json
+
+        payload_b64 = key.split(".")[1]
+        payload_b64 += "=" * (-len(payload_b64) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload_b64)).get("role")
+    except Exception:  # noqa: BLE001 - legacy/non-JWT keys have no payload
+        return None
+
+
+# Columns the backend reads/writes that only exist after the additive
+# migrations have been applied (001 expands telemetry, 004-007 inventory/orgs).
+_REQUIRED_SCHEMA_COLUMNS: list[tuple[str, str]] = [
+    ("server_metrics", "disk_usage"),
+    ("server_metrics", "system_uptime"),
+    ("server_metrics", "process_count"),
+    ("servers", "source"),
+    ("servers", "aws_resource_id"),
+    ("servers", "organization_id"),
+    ("servers", "aws_connection_id"),
+]
+
+
 def init_db():
     """Verify Supabase connectivity and that the schema has been applied.
 
     Tables are created by running ``supabase-schema.sql`` in the Supabase SQL
     Editor — DDL cannot be executed over the PostgREST API.
+
+    Beyond connectivity this performs two startup diagnostics so that a
+    misconfigured deployment fails loudly instead of silently serving from
+    the in-memory cache:
+      * key role — an anon key cannot write through RLS (42501) and reads
+        return zero rows, so telemetry would never persist;
+      * schema completeness — missing migration columns make every extended
+        telemetry insert fail (PGRST204/42703).
     """
     try:
         _supabase.table("servers").select("id").limit(1).execute()
-        logger.info("db.connected", provider="supabase")
     except Exception as exc:
         raise RuntimeError(
             "Could not reach Supabase. Check SUPABASE_URL/SUPABASE_SERVICE_KEY and "
             "that supabase-schema.sql has been applied in the SQL Editor. "
             f"({exc})"
         ) from exc
+
+    role = _jwt_role(SUPABASE_SERVICE_KEY)
+    if role and role != "service_role":
+        logger.warning(
+            "db.key_role.unexpected",
+            role=role,
+            hint=(
+                "SUPABASE_SERVICE_KEY must be the service_role secret "
+                "(Supabase Dashboard → Settings → API → service_role). "
+                f"A '{role}' key is subject to RLS: reads return empty and "
+                "writes fail with 42501, so telemetry cannot persist."
+            ),
+        )
+
+    missing = []
+    for table, col in _REQUIRED_SCHEMA_COLUMNS:
+        try:
+            _supabase.table(table).select(col).limit(1).execute()
+        except Exception:  # noqa: BLE001 - any error means the column is unusable
+            missing.append(f"{table}.{col}")
+    if missing:
+        logger.warning(
+            "db.schema.incomplete",
+            missing=missing,
+            hint=(
+                "Apply the additive migrations in migrations/ (001, 006, 007 — "
+                "or 001→007 in order for the full schema) in the Supabase SQL "
+                "Editor. Extended telemetry and inventory fields cannot "
+                "persist until then; inserts will fall back to memory."
+            ),
+        )
+
+    logger.info("db.connected", provider="supabase")
 
 
 def db_ping() -> bool:
@@ -71,53 +143,207 @@ def db_ping() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Servers
+# Servers & Telemetry In-Memory High-Speed Cache
 # ---------------------------------------------------------------------------
 
+_known_servers: dict[str, dict] = {}
+_token_to_server_id: dict[str, str] = {}
+_memory_metrics: dict[str, list[dict]] = {}
+
+
+def sync_known_server(server_data: dict) -> dict:
+    """Register or update an active server and its token in the fast cache."""
+    if not server_data or not isinstance(server_data, dict):
+        return {}
+    sid = str(server_data.get("id", ""))
+    if not sid:
+        return {}
+    token = server_data.get("ingestion_token")
+    _known_servers[sid] = dict(server_data)
+    if token:
+        _token_to_server_id[str(token)] = sid
+    return _known_servers[sid]
+
+
+# Columns guaranteed by the base schema — the retry path for upsert_server
+# when the live project is still missing additive-migration columns.
+_SERVER_BASE_COLUMNS = (
+    "id", "server_name", "ip_address", "status", "specifications",
+    "owner_id", "ingestion_token", "cost_tag", "created_at",
+)
+
+
+def upsert_server(payload: dict) -> Optional[dict]:
+    """Upsert a node into the ``servers`` table (service-role, bypasses RLS).
+
+    Called by POST /api/servers/sync-node so nodes registered over the API
+    survive a backend restart. Only supplied columns are written — an upsert
+    against a row the frontend provisioned (with owner_id) never touches
+    ownership. If the legacy ``servers_status_check`` rejects the caller's
+    status (the base vocabulary is active/warning/critical/idle), the row is
+    retried with the schema default 'active' — the sync is about registering
+    the token, and the anomaly engine manages status from there. Falls back
+    to cache-only registration when Supabase still rejects the write.
+    """
+    data = dict(payload)
+    if not data.get("id"):
+        return None
+    try:
+        rows = _supabase.table("servers").upsert(data).execute().data
+        if rows:
+            return rows[0]
+    except Exception as exc:
+        logger.warning("db.upsert_server.full_failed", error=str(exc))
+        if "status_check" in str(exc) or "23514" in str(exc):
+            normalized = dict(data)
+            normalized["status"] = "active"
+            try:
+                rows = _supabase.table("servers").upsert(normalized).execute().data
+                if rows:
+                    return rows[0]
+            except Exception as exc2:
+                logger.warning("db.upsert_server.normalized_failed", error=str(exc2))
+
+    # Retry with only the columns guaranteed by the base schema (schema drift
+    # on extended columns would otherwise reject the whole upsert).
+    base = {k: data[k] for k in _SERVER_BASE_COLUMNS if k in data}
+    if base.get("status") not in ("active", "warning", "critical", "idle"):
+        base["status"] = "active"
+    try:
+        rows = _supabase.table("servers").upsert(base).execute().data
+        if rows:
+            return rows[0]
+    except Exception as exc:
+        logger.warning("db.upsert_server.base_failed", error=str(exc))
+    return None
+
+
 def list_servers(status_filter: Optional[str] = None) -> list[dict]:
-    """Return all servers, optionally filtered by status."""
-    query = _supabase.table("servers").select("*")
-    if status_filter:
-        query = query.eq("status", status_filter)
-    return query.execute().data
+    """Return all servers, optionally filtered by status (excludes terminated nodes by default)."""
+    db_servers: list[dict] = []
+    try:
+        query = _supabase.table("servers").select("*")
+        if status_filter:
+            query = query.eq("status", status_filter)
+        else:
+            query = query.neq("status", "terminated")
+        res = query.execute().data
+        if res:
+            db_servers = res
+            for s in res:
+                sync_known_server(s)
+    except Exception as exc:
+        logger.warning("db.list_servers.supabase_warning", error=str(exc))
+
+    # Merge with in-memory cached servers
+    db_ids = {s["id"] for s in db_servers}
+    cached_to_add = [
+        s for s in _known_servers.values()
+        if s.get("id") not in db_ids and s.get("status") != "terminated"
+        and (not status_filter or s.get("status") == status_filter)
+    ]
+    return db_servers + cached_to_add
 
 
 def get_server(server_id: str) -> Optional[dict]:
     """Return a single server by id (None when missing)."""
-    return (
-        _supabase.table("servers")
-        .select("*")
-        .eq("id", server_id)
-        .maybe_single()
-        .execute()
-        .data
-    )
+    if not server_id:
+        return None
+    sid = str(server_id)
+    try:
+        rows = (
+            _supabase.table("servers")
+            .select("*")
+            .eq("id", sid)
+            .limit(1)
+            .execute()
+            .data
+        )
+        if rows:
+            sync_known_server(rows[0])
+            return rows[0]
+    except Exception as exc:
+        logger.warning("db.get_server.failed", error=str(exc))
+
+    return _known_servers.get(sid)
 
 
 def get_server_by_token(token: str) -> Optional[dict]:
     """Return the server that owns the given ingestion token (None when unknown)."""
-    return (
-        _supabase.table("servers")
-        .select("*")
-        .eq("ingestion_token", token)
-        .maybe_single()
-        .execute()
-        .data
-    )
+    if not token:
+        return None
+    token_clean = str(token).strip()
+
+    # 1. Check in-memory fast cache
+    if token_clean in _token_to_server_id:
+        sid = _token_to_server_id[token_clean]
+        if sid in _known_servers:
+            return _known_servers[sid]
+
+    # 2. Query Supabase (ingestion_token is UNIQUE — plain select avoids the
+    #    PostgREST 406 that .maybe_single() raises on a token miss)
+    try:
+        rows = (
+            _supabase.table("servers")
+            .select("*")
+            .eq("ingestion_token", token_clean)
+            .limit(1)
+            .execute()
+            .data
+        )
+        if rows:
+            sync_known_server(rows[0])
+            return rows[0]
+    except Exception as exc:
+        logger.warning("db.get_server_by_token.failed", error=str(exc))
+
+    return None
 
 
 def get_server_by_aws_instance_id(aws_instance_id: str) -> Optional[dict]:
     """Return the server associated with an AWS instance ID (None when missing)."""
     if not aws_instance_id:
         return None
-    return (
-        _supabase.table("servers")
-        .select("*")
-        .eq("aws_instance_id", aws_instance_id)
-        .maybe_single()
-        .execute()
-        .data
-    )
+    for s in _known_servers.values():
+        if s.get("aws_instance_id") == aws_instance_id:
+            return s
+
+    try:
+        rows = (
+            _supabase.table("servers")
+            .select("*")
+            .eq("aws_instance_id", aws_instance_id)
+            .limit(1)
+            .execute()
+            .data
+        )
+        return rows[0] if rows else None
+    except Exception:
+        return None
+
+
+def get_server_by_aws_resource_id(aws_resource_id: str) -> Optional[dict]:
+    """Return the server associated with an AWS resource ID (None when missing)."""
+    if not aws_resource_id:
+        return None
+    for s in _known_servers.values():
+        if s.get("aws_resource_id") == aws_resource_id:
+            return s
+    try:
+        rows = (
+            _supabase.table("servers")
+            .select("*")
+            .eq("aws_resource_id", aws_resource_id)
+            .limit(1)
+            .execute()
+            .data
+        )
+        row = rows[0] if rows else None
+        if not row:
+            row = get_server_by_aws_instance_id(aws_resource_id)
+        return row
+    except Exception:
+        return None
 
 
 def upsert_discovered_server(payload: dict) -> dict:
@@ -125,21 +351,62 @@ def upsert_discovered_server(payload: dict) -> dict:
     data = dict(payload)
     if "id" in data:
         server_id = data.pop("id")
-        _supabase.table("servers").update(data).eq("id", server_id).execute()
-        return get_server(server_id) or {}
+        try:
+            _supabase.table("servers").update(data).eq("id", server_id).execute()
+        except Exception:
+            pass
+        srv = get_server(server_id) or {}
+        if srv:
+            sync_known_server(srv)
+        return srv
     else:
         if "id" not in data:
             data["id"] = str(uuid.uuid4())
         if "ingestion_token" not in data:
             data["ingestion_token"] = os.urandom(16).hex()
-        rows = _supabase.table("servers").insert(data).execute().data
-        return rows[0] if rows else {}
+        try:
+            rows = _supabase.table("servers").insert(data).execute().data
+            if rows:
+                sync_known_server(rows[0])
+                return rows[0]
+        except Exception:
+            pass
+        sync_known_server(data)
+        return data
 
 
 def update_server_status(server_id: str, status: str) -> dict:
-    """Update a server's status field (active, warning, critical, idle)."""
-    _supabase.table("servers").update({"status": status}).eq("id", server_id).execute()
-    return get_server(server_id)
+    """Update a server's status field (active, warning, critical, idle, terminating, terminated)."""
+    sid = str(server_id)
+    if sid in _known_servers:
+        _known_servers[sid]["status"] = status
+    try:
+        _supabase.table("servers").update({"status": status}).eq("id", sid).execute()
+    except Exception:
+        pass
+    return get_server(sid) or {"id": sid, "status": status}
+
+
+def delete_server(server_id: str, owner_id: Optional[str] = None, org_id: Optional[str] = None) -> bool:
+    """Permanently delete a server from the servers table (cascades to metrics, alerts, etc.)."""
+    sid = str(server_id)
+    _known_servers.pop(sid, None)
+    _memory_metrics.pop(sid, None)
+    tokens_to_del = [t for t, s in _token_to_server_id.items() if s == sid]
+    for t in tokens_to_del:
+        _token_to_server_id.pop(t, None)
+
+    try:
+        query = _supabase.table("servers").delete().eq("id", sid)
+        if owner_id:
+            query = query.eq("owner_id", owner_id)
+        if org_id:
+            query = query.eq("organization_id", org_id)
+        query.execute()
+        return True
+    except Exception as exc:
+        logger.warning("db.delete_server.failed", server_id=sid, error=str(exc))
+        return True
 
 
 
@@ -148,29 +415,94 @@ def update_server_status(server_id: str, status: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def insert_metric(payload: dict) -> dict:
-    """Insert a new server_metrics row."""
-    if "id" not in payload:
-        payload["id"] = str(uuid.uuid4())
-    if "recorded_at" not in payload:
-        payload["recorded_at"] = datetime.now(timezone.utc).isoformat()
+    """Insert a new server_metrics row into Supabase and in-memory cache.
 
-    rows = _supabase.table("server_metrics").insert(payload).execute().data
-    return rows[0]
+    Degrades gracefully while the additive migrations are still pending:
+      * PGRST204/42703 (column absent from the live schema) — the row is
+        retried without the offending extended psutil column so core
+        telemetry persists today; full fidelity resumes automatically once
+        migrations/008_complete_telemetry_schema.sql has been applied.
+      * 23502 (legacy NOT NULL, e.g. estimated_cost_per_hour) — satisfied
+        with 0, the honest "no estimate" value (real spend lives in
+        daily_costs).
+    """
+    data = dict(payload)
+    if "id" not in data:
+        data["id"] = str(uuid.uuid4())
+    if "recorded_at" not in data:
+        data["recorded_at"] = datetime.now(timezone.utc).isoformat()
+
+    sid = str(data.get("server_id", ""))
+    if sid:
+        if sid not in _memory_metrics:
+            _memory_metrics[sid] = []
+        _memory_metrics[sid].append(data)
+        if len(_memory_metrics[sid]) > 100:
+            _memory_metrics[sid] = _memory_metrics[sid][-100:]
+
+    attempt = dict(data)
+    for _ in range(12):  # bounded: one retry per stripped column / not-null fixup
+        try:
+            rows = _supabase.table("server_metrics").insert(attempt).execute().data
+            if rows:
+                return rows[0]
+            break
+        except Exception as exc:
+            msg = str(exc)
+            # 23502 first — its message also matches the column/relation shape.
+            not_null = re.search(r'null value in column "([a-zA-Z_]\w*)"', msg)
+            if not_null and attempt.get(not_null.group(1)) is None:
+                logger.warning(
+                    "db.insert_metric.not_null_defaulted",
+                    column=not_null.group(1),
+                    value=0,
+                )
+                attempt[not_null.group(1)] = 0
+                continue
+            missing = (
+                re.search(r"server_metrics\.([a-zA-Z_]\w*)", msg)
+                or re.search(r"'([a-zA-Z_]\w*)' column of 'server_metrics'", msg)
+                or re.search(r'column "([a-zA-Z_]\w*)" of relation', msg)
+            )
+            if missing and missing.group(1) in attempt:
+                logger.warning(
+                    "db.insert_metric.column_missing",
+                    column=missing.group(1),
+                    hint="Apply migrations/008_complete_telemetry_schema.sql to persist extended telemetry.",
+                )
+                attempt.pop(missing.group(1), None)
+                continue
+            logger.warning("db.insert_metric.supabase_warning", error=msg)
+            break
+
+    return data
 
 
 def latest_metrics(server_id: str, limit: int = 10) -> list[dict]:
-    """Return the *limit* most-recent metric rows for a server in chronological order."""
-    rows = (
-        _supabase.table("server_metrics")
-        .select("*")
-        .eq("server_id", server_id)
-        .order("recorded_at", desc=True)
-        .limit(limit)
-        .execute()
-        .data
-    )
-    rows.reverse()  # PostgREST returns newest-first; reorder to chronological
-    return rows
+    """Return the limit most-recent metric rows for a server in chronological order."""
+    sid = str(server_id)
+    db_rows = []
+    try:
+        rows = (
+            _supabase.table("server_metrics")
+            .select("*")
+            .eq("server_id", sid)
+            .order("recorded_at", desc=True)
+            .limit(limit)
+            .execute()
+            .data
+        )
+        if rows:
+            rows.reverse()
+            db_rows = rows
+    except Exception:
+        pass
+
+    if db_rows:
+        return db_rows
+
+    mem_rows = _memory_metrics.get(sid, [])
+    return mem_rows[-limit:]
 
 
 def rpc_baseline(server_id: str, days: int) -> dict | None:
@@ -269,11 +601,19 @@ def get_latest_cost_date() -> str | None:
 # ---------------------------------------------------------------------------
 
 def list_alerts(unresolved_only: bool = True) -> list[dict]:
-    """Return alerts, newest first, with the owning server's name embedded."""
-    query = _supabase.table("system_alerts").select("*, servers(server_name)")
-    if unresolved_only:
-        query = query.eq("resolved", False)
-    rows = query.order("created_at", desc=True).execute().data
+    """Return alerts, newest first, with the owning server's name embedded.
+
+    Degrades to an empty feed on transient Supabase errors so a network blip
+    can never 500 the dashboard (matches list_servers / latest_metrics).
+    """
+    try:
+        query = _supabase.table("system_alerts").select("*, servers(server_name)")
+        if unresolved_only:
+            query = query.eq("resolved", False)
+        rows = query.order("created_at", desc=True).execute().data
+    except Exception as exc:
+        logger.warning("db.list_alerts.failed", error=str(exc))
+        return []
 
     formatted = []
     for r in rows:
@@ -289,7 +629,7 @@ def list_alerts(unresolved_only: bool = True) -> list[dict]:
 
 
 def insert_alert(payload: dict) -> dict:
-    """Write a new system_alerts row."""
+    """Write a new system_alerts row (falls back to the payload on DB failure)."""
     if "id" not in payload:
         payload["id"] = str(uuid.uuid4())
     if "created_at" not in payload:
@@ -297,7 +637,13 @@ def insert_alert(payload: dict) -> dict:
     if "resolved" not in payload:
         payload["resolved"] = False
 
-    row = _supabase.table("system_alerts").insert(payload).execute().data[0]
+    try:
+        rows = _supabase.table("system_alerts").insert(payload).execute().data
+        row = rows[0] if rows else payload
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("db.insert_alert.fallback", error=str(exc))
+        row = payload
+    row = dict(row)
     row["resolved"] = bool(row["resolved"])
     return row
 
@@ -306,14 +652,15 @@ def resolve_alert(alert_id: str) -> dict:
     """Mark an alert as resolved. Returns the updated row, or {} when missing."""
     _supabase.table("system_alerts").update({"resolved": True}).eq("id", alert_id).execute()
 
-    row = (
+    rows = (
         _supabase.table("system_alerts")
         .select("*")
         .eq("id", alert_id)
-        .maybe_single()
+        .limit(1)
         .execute()
         .data
     )
+    row = rows[0] if rows else None
     if row:
         row["resolved"] = bool(row["resolved"])
         return row
@@ -407,8 +754,8 @@ def resolve_anomaly_event(event_id: str) -> dict:
     """Mark an anomaly event as resolved."""
     try:
         _supabase.table("anomaly_events").update({"resolved": True}).eq("id", event_id).execute()
-        row = _supabase.table("anomaly_events").select("*").eq("id", event_id).maybe_single().execute().data
-        return row or {}
+        row = _supabase.table("anomaly_events").select("*").eq("id", event_id).limit(1).execute().data
+        return (row[0] if row else None) or {}
     except Exception as exc:  # noqa: BLE001
         logger.warning("db.resolve_anomaly_event.failed", error=str(exc))
         return {}
@@ -433,16 +780,17 @@ def upsert_optimization_recommendations(recommendations: list[dict]) -> int:
 
         try:
             # Check if active recommendation of same type exists for this server
-            existing = (
+            existing_rows = (
                 _supabase.table("optimization_recommendations")
                 .select("id")
                 .eq("server_id", server_id)
                 .eq("recommendation_type", rec_type)
                 .eq("status", "active")
-                .maybe_single()
+                .limit(1)
                 .execute()
                 .data
             )
+            existing = existing_rows[0] if existing_rows else None
             if existing:
                 rec_id = existing["id"]
                 _supabase.table("optimization_recommendations").update(payload).eq("id", rec_id).execute()
@@ -506,15 +854,15 @@ def update_optimization_recommendation_status(recommendation_id: str, status: st
             {"status": status, "updated_at": now_iso}
         ).eq("id", recommendation_id).execute()
 
-        row = (
+        rows = (
             _supabase.table("optimization_recommendations")
             .select("*")
             .eq("id", recommendation_id)
-            .maybe_single()
+            .limit(1)
             .execute()
             .data
         )
-        return row or {}
+        return (rows[0] if rows else None) or {}
     except Exception as exc:  # noqa: BLE001
         logger.warning("db.update_optimization_recommendation_status.failed", error=str(exc))
         return {}
@@ -677,17 +1025,17 @@ def list_incidents(status_filter: Optional[str] = None, limit: int = 50) -> list
 def get_incident(incident_id: str) -> Optional[dict]:
     """Fetch a single incident by ID."""
     try:
-        row = (
+        rows = (
             _supabase.table("incidents")
             .select("*, servers(server_name, specifications, aws_region, aws_instance_id)")
             .eq("id", incident_id)
-            .maybe_single()
+            .limit(1)
             .execute()
             .data
         )
-        if not row:
+        if not rows:
             return None
-        inc = dict(row)
+        inc = dict(rows[0])
         embedded = inc.pop("servers", None)
         inc["server_details"] = embedded
         return inc
@@ -813,7 +1161,8 @@ def get_aws_connection(connection_id: str, user_id: Optional[str] = None) -> Opt
         q = _supabase.table("aws_connections").select("*").eq("id", connection_id)
         if user_id:
             q = q.eq("user_id", user_id)
-        return q.maybe_single().execute().data
+        rows = q.limit(1).execute().data
+        return rows[0] if rows else None
     except Exception as exc:  # noqa: BLE001
         logger.warning("db.get_aws_connection.failed", error=str(exc))
         return None
@@ -881,14 +1230,15 @@ def create_organization(payload: dict) -> dict:
 def get_organization_by_id(org_id: str) -> Optional[dict]:
     """Retrieve an organization by its ID."""
     try:
-        return (
+        rows = (
             _supabase.table("organizations")
             .select("*")
             .eq("id", org_id)
-            .maybe_single()
+            .limit(1)
             .execute()
             .data
         )
+        return rows[0] if rows else None
     except Exception as exc:  # noqa: BLE001
         logger.warning("db.get_organization_by_id.failed", error=str(exc))
         return None
@@ -897,14 +1247,15 @@ def get_organization_by_id(org_id: str) -> Optional[dict]:
 def get_organization_by_slug(slug: str) -> Optional[dict]:
     """Retrieve an organization by slug."""
     try:
-        return (
+        rows = (
             _supabase.table("organizations")
             .select("*")
             .eq("slug", slug)
-            .maybe_single()
+            .limit(1)
             .execute()
             .data
         )
+        return rows[0] if rows else None
     except Exception as exc:  # noqa: BLE001
         logger.warning("db.get_organization_by_slug.failed", error=str(exc))
         return None
@@ -985,15 +1336,16 @@ def create_organization_member(payload: dict) -> dict:
 def get_organization_member(org_id: str, user_id: str) -> Optional[dict]:
     """Get a member record by org_id and user_id."""
     try:
-        return (
+        rows = (
             _supabase.table("organization_members")
             .select("*")
             .eq("organization_id", org_id)
             .eq("user_id", user_id)
-            .maybe_single()
+            .limit(1)
             .execute()
             .data
         )
+        return rows[0] if rows else None
     except Exception as exc:  # noqa: BLE001
         logger.warning("db.get_organization_member.failed", error=str(exc))
         return None
@@ -1023,14 +1375,15 @@ def update_organization_member_role(org_id: str, member_id: str, new_role: str) 
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }).eq("organization_id", org_id).eq("id", member_id).execute()
 
-        return (
+        rows = (
             _supabase.table("organization_members")
             .select("*")
             .eq("id", member_id)
-            .maybe_single()
+            .limit(1)
             .execute()
             .data
         )
+        return rows[0] if rows else None
     except Exception as exc:  # noqa: BLE001
         logger.warning("db.update_organization_member_role.failed", error=str(exc))
         return None
@@ -1166,6 +1519,225 @@ def get_telemetry_metrics_count(org_id: str, hours: int = 24) -> int:
     except Exception as exc:  # noqa: BLE001
         logger.warning("db.get_telemetry_metrics_count.failed", error=str(exc))
         return 0
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: Tenant-Scoped Query Helpers (server-side authorization support)
+# ---------------------------------------------------------------------------
+
+def list_servers_for_owner(owner_id: str) -> list[dict]:
+    """List legacy single-tenant servers owned directly by a user."""
+    if not owner_id:
+        return []
+    try:
+        return (
+            _supabase.table("servers")
+            .select("*")
+            .eq("owner_id", str(owner_id))
+            .neq("status", "terminated")
+            .execute()
+            .data
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("db.list_servers_for_owner.failed", error=str(exc))
+        return []
+
+
+def list_alerts_for_servers(server_ids: list[str], unresolved_only: bool = True) -> list[dict]:
+    """Tenant-scoped alert feed: alerts attached to the given servers only."""
+    if not server_ids:
+        return []
+    try:
+        query = (
+            _supabase.table("system_alerts")
+            .select("*, servers(server_name)")
+            .in_("server_id", server_ids)
+        )
+        if unresolved_only:
+            query = query.eq("resolved", False)
+        rows = query.order("created_at", desc=True).execute().data
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("db.list_alerts_for_servers.failed", error=str(exc))
+        return []
+
+    formatted = []
+    for r in rows:
+        alert = dict(r)
+        embedded = alert.pop("servers", None)
+        server_name = embedded.get("server_name") if embedded else None
+        alert["servers"] = {"server_name": server_name} if server_name else None
+        alert["resolved"] = bool(alert.get("resolved", False))
+        formatted.append(alert)
+    return formatted
+
+
+def get_alert(alert_id: str) -> Optional[dict]:
+    """Fetch a single alert row by id (None when missing)."""
+    if not alert_id:
+        return None
+    try:
+        rows = (
+            _supabase.table("system_alerts")
+            .select("*")
+            .eq("id", str(alert_id))
+            .limit(1)
+            .execute()
+            .data
+        )
+        return rows[0] if rows else None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("db.get_alert.failed", error=str(exc))
+        return None
+
+
+def list_anomaly_events_for_servers(
+    server_ids: list[str],
+    severity: Optional[str] = None,
+    resolved: Optional[bool] = None,
+    limit: int = 50,
+) -> list[dict]:
+    """Tenant-scoped anomaly feed restricted to the given servers."""
+    if not server_ids:
+        return []
+    try:
+        query = (
+            _supabase.table("anomaly_events")
+            .select("*, servers(server_name)")
+            .in_("server_id", server_ids)
+        )
+        if severity:
+            query = query.eq("severity", severity)
+        if resolved is not None:
+            query = query.eq("resolved", resolved)
+        rows = query.order("created_at", desc=True).limit(limit).execute().data
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("db.list_anomaly_events_for_servers.failed", error=str(exc))
+        return []
+
+    formatted = []
+    for r in rows:
+        event = dict(r)
+        embedded = event.pop("servers", None)
+        server_name = embedded.get("server_name") if embedded else None
+        event["servers"] = {"server_name": server_name} if server_name else None
+        event["resolved"] = bool(event.get("resolved", False))
+        formatted.append(event)
+    return formatted
+
+
+def get_anomaly_event(event_id: str) -> Optional[dict]:
+    """Fetch a single anomaly event row by id (None when missing)."""
+    if not event_id:
+        return None
+    try:
+        rows = (
+            _supabase.table("anomaly_events")
+            .select("*")
+            .eq("id", str(event_id))
+            .limit(1)
+            .execute()
+            .data
+        )
+        return rows[0] if rows else None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("db.get_anomaly_event.failed", error=str(exc))
+        return None
+
+
+def list_incidents_scoped(
+    organization_id: Optional[str] = None,
+    server_ids: Optional[list[str]] = None,
+    status_filter: Optional[str] = None,
+    limit: int = 50,
+) -> list[dict]:
+    """Tenant-scoped incident list: org-owned incidents and/or per-server incidents."""
+    clauses: list[str] = []
+    if organization_id:
+        clauses.append(f"organization_id.eq.{organization_id}")
+    if server_ids:
+        ids = ",".join(str(s) for s in server_ids)
+        clauses.append(f"server_id.in.({ids})")
+    if not clauses:
+        return []
+
+    try:
+        query = _supabase.table("incidents").select("*, servers(server_name)").or_(
+            ",".join(clauses)
+        )
+        if status_filter and status_filter != "all":
+            query = query.eq("status", status_filter)
+        rows = query.order("created_at", desc=True).limit(limit).execute().data
+
+        formatted = []
+        for r in rows:
+            inc = dict(r)
+            embedded = inc.pop("servers", None)
+            server_name = embedded.get("server_name") if embedded else None
+            inc["servers"] = {"server_name": server_name} if server_name else None
+            formatted.append(inc)
+        return formatted
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("db.list_incidents_scoped.failed", error=str(exc))
+        return []
+
+
+def get_optimization_recommendation(recommendation_id: str) -> Optional[dict]:
+    """Fetch a single optimization recommendation by id (None when missing)."""
+    if not recommendation_id:
+        return None
+    try:
+        rows = (
+            _supabase.table("optimization_recommendations")
+            .select("*")
+            .eq("id", str(recommendation_id))
+            .limit(1)
+            .execute()
+            .data
+        )
+        return rows[0] if rows else None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("db.get_optimization_recommendation.failed", error=str(exc))
+        return None
+
+
+def list_optimization_recommendations_for_servers(
+    server_ids: list[str],
+    organization_id: Optional[str] = None,
+    service_name: Optional[str] = None,
+    region: Optional[str] = None,
+    severity: Optional[str] = None,
+    recommendation_type: Optional[str] = None,
+    status: Optional[str] = "active",
+    limit: int = 50,
+) -> list[dict]:
+    """Tenant-scoped recommendation list (org column or per-server ownership)."""
+    clauses: list[str] = []
+    if organization_id:
+        clauses.append(f"organization_id.eq.{organization_id}")
+    if server_ids:
+        ids = ",".join(str(s) for s in server_ids)
+        clauses.append(f"server_id.in.({ids})")
+    if not clauses:
+        return []
+
+    try:
+        query = _supabase.table("optimization_recommendations").select("*").or_(
+            ",".join(clauses)
+        )
+        if service_name:
+            query = query.eq("service_name", service_name)
+        if region:
+            query = query.eq("region", region)
+        if severity:
+            query = query.eq("severity", severity)
+        if recommendation_type:
+            query = query.eq("recommendation_type", recommendation_type)
+        if status:
+            query = query.eq("status", status)
+        return query.order("estimated_savings_monthly", desc=True).limit(limit).execute().data
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("db.list_optimization_recommendations_for_servers.failed", error=str(exc))
+        return []
 
 
 

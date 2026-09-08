@@ -54,7 +54,7 @@ class TestSyncEngineAndHealth:
         diag = diagnose_connection_health(conn)
         assert diag["health_status"] == "DEGRADED"
         assert diag["checks"]["cost_explorer_permissions"]["status"] == "FAIL"
-        assert "Cost Explorer permission missing" in diag["checks"]["cost_explorer_permissions"]["message"]
+        assert "Cost Explorer permission" in diag["checks"]["cost_explorer_permissions"]["message"]
 
     @patch("sync_engine.get_aws_connection")
     @patch("sync_engine.update_aws_connection")
