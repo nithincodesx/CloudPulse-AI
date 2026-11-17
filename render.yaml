@@ -22,6 +22,9 @@ services:
         sync: false # set in dashboard
       - key: SUPABASE_SERVICE_KEY
         sync: false # set in dashboard — NEVER commit this
+      # --- Required: verifies dashboard login JWTs (Supabase → Settings → API → JWT Secret) ---
+      - key: SUPABASE_JWT_SECRET
+        sync: false # set in dashboard — without it every dashboard call 401s
       # --- Browser origins allowed by CORS (the deployed Vercel app) ---
       - key: CORS_ORIGINS
         value: https://cloudpulse-ai.vercel.app

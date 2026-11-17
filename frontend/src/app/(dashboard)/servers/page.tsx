@@ -24,7 +24,7 @@ import {
   Radio,
 } from "lucide-react";
 import { useDashboard } from "@/lib/DashboardContext";
-import { supabase } from "@/lib/supabase";
+import { supabase, apiFetch } from "@/lib/supabase";
 import { useAuth } from "@/lib/AuthContext";
 import ServerTable from "@/components/ServerTable";
 import CpuRamChart from "@/components/CpuRamChart";
@@ -119,13 +119,11 @@ export default function ServersPage() {
 
       // Also update token map and sync with backend memory cache
       const map: Record<string, string> = {};
-      const backendUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
       (rows ?? []).forEach((r: any) => {
         if (r.id && r.ingestion_token) {
           map[r.id] = r.ingestion_token;
-          fetch(`${backendUrl}/api/servers/sync-node`, {
+          apiFetch("/api/servers/sync-node", {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
             body: JSON.stringify(r),
           }).catch(() => {});
         }
@@ -231,10 +229,8 @@ export default function ServersPage() {
 
       // Sync new node into backend registry
       try {
-        const backendUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
-        fetch(`${backendUrl}/api/servers/sync-node`, {
+        apiFetch("/api/servers/sync-node", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
           body: JSON.stringify(newRow),
         }).catch(() => {});
       } catch {}

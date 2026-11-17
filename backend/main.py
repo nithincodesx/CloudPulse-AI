@@ -18,6 +18,7 @@ from database import (
     create_or_update_incident,
     db_ping,
     delete_alert_rule,
+    delete_organization,
     delete_server,
     delete_aws_connection,
     delete_notification_channel,
@@ -25,6 +26,8 @@ from database import (
     get_daily_costs,
     get_incident,
     get_latest_cost_date,
+    get_organization_by_id,
+    get_organization_counts,
     get_server,
     get_organization_member,
     get_server_by_token,
@@ -40,6 +43,7 @@ from database import (
     upsert_server,
     list_alert_rules,
     list_alerts,
+    list_alerts_for_servers,
     list_anomaly_events,
     list_aws_connections,
     list_aws_connections_for_org,
@@ -49,12 +53,16 @@ from database import (
     list_notification_channels,
     list_notification_logs,
     list_optimization_recommendations,
+    list_organization_members,
+    list_organizations_for_user,
     list_servers,
+    list_servers_for_org,
     resolve_alert,
     resolve_anomaly_event,
     rpc_baseline,
     update_aws_connection,
     update_incident_status,
+    update_organization,
     update_optimization_recommendation_status,
     update_server_status,
     upsert_alert_rule,
@@ -71,6 +79,7 @@ from auth import (
     resolve_org_for_user,
 )
 from aws_credentials import (
+    diagnose_connection_health,
     generate_cloudformation_quick_launch_url,
     generate_external_id,
     generate_iam_permissions_policy,
@@ -514,7 +523,10 @@ def ingest_metrics(request: Request, payload: MetricPayload = Body(...)):
 
 
 @app.post("/api/servers/sync-node")
-def sync_node_endpoint(payload: dict = Body(...)):
+def sync_node_endpoint(
+    payload: dict = Body(...),
+    user: AuthenticatedUser = Depends(get_current_user),
+):
     """Register or sync a node's metadata and ingestion token into the backend.
 
     The node is also upserted into Supabase (service-role key, RLS bypassed)
@@ -530,10 +542,19 @@ def sync_node_endpoint(payload: dict = Body(...)):
 
 
 @app.get("/api/servers/status", response_model=ServerStatusResponse)
-def server_status():
-    """Aggregated view of all servers, latest metrics, and unresolved alerts."""
-    servers = list_servers()
-    active_alerts = list_alerts(unresolved_only=True)
+def server_status(user: AuthenticatedUser = Depends(get_current_user)):
+    """Aggregated view of the caller's workspace: servers, metrics, alerts.
+
+    Tenant-scoped — only the authenticated user's organization is ever
+    returned (auto-provisions the default workspace on first run).
+    """
+    org_id, _role = resolve_org_for_user(
+        user, None, permission="view_resources", auto_provision=True
+    )
+    servers = list_servers_for_org(org_id)
+    active_alerts = list_alerts_for_servers(
+        [str(s["id"]) for s in servers], unresolved_only=True
+    )
 
     # Build a summary
     total_nodes = len(servers)
@@ -630,7 +651,10 @@ def server_status():
 
 
 @app.get("/api/cloud/status", response_model=CloudStatus)
-def cloud_status(connection_id: Optional[str] = None):
+def cloud_status(
+    connection_id: Optional[str] = None,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
     """Current AWS Cost Explorer integration state (tenant connection or default)."""
     conn = get_aws_connection(connection_id) if connection_id else None
     if not conn:
@@ -641,7 +665,11 @@ def cloud_status(connection_id: Optional[str] = None):
 
 
 @app.post("/api/cloud/discover", response_model=DiscoveryResult)
-def cloud_discover(region: Optional[str] = None, connection_id: Optional[str] = None):
+def cloud_discover(
+    region: Optional[str] = None,
+    connection_id: Optional[str] = None,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
     """Trigger AWS EC2 resource discovery to automatically discover and sync instances."""
     conn = get_aws_connection(connection_id) if connection_id else None
     if not conn:
@@ -660,7 +688,10 @@ def cloud_discover(region: Optional[str] = None, connection_id: Optional[str] = 
 
 
 @app.post("/api/cloud/sync", response_model=SyncResult)
-def cloud_sync(connection_id: Optional[str] = None):
+def cloud_sync(
+    connection_id: Optional[str] = None,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
     """Pull real daily costs from AWS Cost Explorer into daily_costs."""
     conn = get_aws_connection(connection_id) if connection_id else None
     if not conn:
@@ -677,7 +708,12 @@ def cloud_sync(connection_id: Optional[str] = None):
         raise HTTPException(status_code=503, detail=result.error)
 
     # Real-spend BUDGET_SPIKE detection on the freshly synced daily costs.
-    for s in list_servers():
+    # Scoped to the caller's workspace so a sync never writes alerts for
+    # another tenant's servers.
+    _sync_org_id, _ = resolve_org_for_user(
+        user, None, permission="view_costs", auto_provision=True
+    )
+    for s in list_servers_for_org(_sync_org_id):
         if detect_budget_spikes(s["id"], days=14):
             insert_alert(
                 {
@@ -698,7 +734,10 @@ def cloud_sync(connection_id: Optional[str] = None):
 # ---------------------------------------------------------------------------
 
 @app.post("/api/aws/connections/initiate", response_model=AWSConnectionInitiateResponse)
-def initiate_aws_connection(payload: AWSConnectionInitiateRequest = Body(default=AWSConnectionInitiateRequest())):
+def initiate_aws_connection(
+    payload: AWSConnectionInitiateRequest = Body(default=AWSConnectionInitiateRequest()),
+    user: AuthenticatedUser = Depends(get_current_user),
+):
     """Generate cryptographically secure ExternalId, Trust Policy, and CloudFormation Quick Launch URL."""
     ext_id = generate_external_id()
     cloudpulse_acc = get_cloudpulse_account_id()
@@ -778,7 +817,10 @@ def verify_aws_connection_endpoint(
 ):
     """Verify an AWS connection by assuming the role and testing permissions."""
     authorize_connection(user, connection_id, permission="view_aws_connections")
-    verified = verify_and_save_connection(connection_id, user_id=user.user_id)
+    try:
+        verified = verify_and_save_connection(connection_id, user_id=user.user_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     is_success = verified.get("status") == "connected"
     return AWSConnectionVerifyResponse(
         success=is_success,
@@ -818,11 +860,16 @@ def sync_aws_connection_endpoint(
 ):
     """Run centralized idempotent AWS sync pipeline."""
     conn = authorize_connection(user, connection_id, permission="sync_aws")
-    result = run_centralized_sync(
-        connection_id=connection_id,
-        organization_id=conn.get("organization_id"),
-        actor_id=user.user_id,
-    )
+    try:
+        result = run_centralized_sync(
+            connection_id=connection_id,
+            organization_id=conn.get("organization_id"),
+            actor_id=user.user_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     return result
 
 
@@ -897,7 +944,10 @@ def get_organization_endpoint(
     user: AuthenticatedUser = Depends(get_current_user),
 ):
     """Get single organization details. Authorized via JWT + org membership."""
-    org, role = resolve_org_for_user(user, org_id, permission="view_org")
+    resolved_org_id, role = resolve_org_for_user(user, org_id, permission="view_org")
+    org = get_organization_by_id(resolved_org_id)
+    if not org:
+        raise HTTPException(status_code=404, detail=f"Organization {org_id} not found")
     counts = get_organization_counts(org_id)
     org["user_role"] = role
     org["members_count"] = counts["members_count"]
@@ -968,13 +1018,16 @@ def invite_org_member_endpoint(
 ):
     """Invite a new member to the organization (OWNER or ADMIN)."""
     resolve_org_for_user(user, org_id, permission="manage_members")
-    invited = invite_member_to_org(
-        organization_id=org_id,
-        email=payload.email,
-        role=payload.role,
-        inviter_id=user.user_id,
-        inviter_email=user.email,
-    )
+    try:
+        invited = invite_member_to_org(
+            organization_id=org_id,
+            email=payload.email,
+            role=payload.role,
+            inviter_id=user.user_id,
+            inviter_email=user.email,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return invited
 
 
@@ -987,13 +1040,18 @@ def update_org_member_role_endpoint(
 ):
     """Update a member's role (OWNER only)."""
     resolve_org_for_user(user, org_id, permission="manage_members")
-    updated = change_member_role(
-        organization_id=org_id,
-        member_id=member_id,
-        new_role=payload.role,
-        actor_id=user.user_id,
-        actor_email=user.email,
-    )
+    try:
+        updated = change_member_role(
+            organization_id=org_id,
+            member_id=member_id,
+            new_role=payload.role,
+            actor_id=user.user_id,
+            actor_email=user.email,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     return updated
 
 
@@ -1045,13 +1103,16 @@ def get_org_usage_endpoint(
 ):
     """Get billing-ready usage metrics and limit utilization for an organization."""
     resolve_org_for_user(user, org_id, permission="view_org")
-    return calculate_organization_usage(org_id)
+    try:
+        return calculate_organization_usage(org_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 
 
 @app.get("/api/insights/latest", response_model=InsightOut)
-def latest_insight():
+def latest_insight(user: AuthenticatedUser = Depends(get_current_user)):
     """Return the most recent weekly AI summary (404 when none exists yet)."""
     insight = get_latest_summary()
     if not insight:
@@ -1061,7 +1122,7 @@ def latest_insight():
 
 @app.post("/api/insights/generate", response_model=InsightGenerateResult)
 @limiter.limit("2/minute")
-def generate_insight(request: Request):
+def generate_insight(request: Request, user: AuthenticatedUser = Depends(get_current_user)):
     """Generate (or refresh) the weekly AI summary on demand.
 
     Returns 503 with a distinguishing message when the LLM is unconfigured, the
@@ -1093,9 +1154,8 @@ def get_all_alerts(user: AuthenticatedUser = Depends(get_current_user)):
 
 
 @app.get("/api/costs/account")
-def get_account_costs(days: int = 30):
+def get_account_costs(days: int = 30, user: AuthenticatedUser = Depends(get_current_user)):
     """Get cost breakdown by AWS account for multi-account organizations."""
-    user = get_current_user()
     org_id, _role = resolve_org_for_user(user, None, permission="view_costs")
     
     # Get the organization's AWS connections
@@ -1132,9 +1192,8 @@ def get_account_costs(days: int = 30):
 
 
 @app.get("/api/costs/services")
-def get_service_costs(days: int = 30):
+def get_service_costs(days: int = 30, user: AuthenticatedUser = Depends(get_current_user)):
     """Get cost breakdown by AWS service."""
-    user = get_current_user()
     org_id, _role = resolve_org_for_user(user, None, permission="view_costs")
     
     connections = list_aws_connections_for_org(org_id)
@@ -1169,9 +1228,8 @@ def get_service_costs(days: int = 30):
 
 
 @app.get("/api/costs/regions")
-def get_region_costs(days: int = 30):
+def get_region_costs(days: int = 30, user: AuthenticatedUser = Depends(get_current_user)):
     """Get cost breakdown by AWS region."""
-    user = get_current_user()
     org_id, _role = resolve_org_for_user(user, None, permission="view_costs")
     
     connections = list_aws_connections_for_org(org_id)
@@ -1206,9 +1264,10 @@ def get_region_costs(days: int = 30):
 
 
 @app.get("/api/costs/trends/{server_id}")
-def get_cost_trends_endpoint(server_id: str, days: int = 30):
+def get_cost_trends_endpoint(
+    server_id: str, days: int = 30, user: AuthenticatedUser = Depends(get_current_user)
+):
     """Get cost trends for a specific server with actual vs estimated costs."""
-    user = get_current_user()
     authorize_server(user, server_id, permission="view_costs")
     
     trends = get_cost_trends(server_id, days=days)
@@ -1216,9 +1275,10 @@ def get_cost_trends_endpoint(server_id: str, days: int = 30):
 
 
 @app.get("/api/costs/anomalies/{server_id}")
-def get_cost_anomalies_endpoint(server_id: str, days: int = 30):
+def get_cost_anomalies_endpoint(
+    server_id: str, days: int = 30, user: AuthenticatedUser = Depends(get_current_user)
+):
     """Get cost anomalies for a specific server."""
-    user = get_current_user()
     authorize_server(user, server_id, permission="view_costs")
     
     anomalies = detect_cost_anomalies(server_id, days=days)
@@ -1230,9 +1290,6 @@ def resolve_alert_endpoint(alert_id: str, user: AuthenticatedUser = Depends(get_
     """Mark an alert as resolved."""
     org_id, _role = resolve_org_for_user(user, None, permission="manage_alerts")
     result = resolve_alert(alert_id, org_id=org_id)
-    if not result:
-        raise HTTPException(404, detail=f"Alert {alert_id} not found")
-    return result
     if not result:
         raise HTTPException(404, detail=f"Alert {alert_id} not found")
     return result
@@ -1653,7 +1710,7 @@ def update_incident_status_endpoint(
             message=f"Status changed to {payload.status.upper()} by {payload.actor}."
             + (f" Root cause / Notes: {payload.resolution_notes}" if payload.resolution_notes else ""),
             actor=payload.actor,
-            meta={"previous_status": current_status, "new_status": payload.status},
+            meta={"previous_status": inc.get("status"), "new_status": payload.status},
         )
     )
 

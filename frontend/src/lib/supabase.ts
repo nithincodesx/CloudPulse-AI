@@ -61,21 +61,41 @@ if (!API_URL) {
   );
 }
 
+/**
+ * Authenticated backend fetch.
+ *
+ * Every dashboard-plane endpoint requires the signed-in user's Supabase
+ * access token (`Authorization: Bearer <jwt>`); the backend verifies it
+ * against SUPABASE_JWT_SECRET and scopes all data to the user's
+ * workspace. Calls made without this header are rejected with 401, so
+ * ALL backend requests must go through this helper — never raw `fetch`.
+ */
+export async function apiFetch(path: string, init: RequestInit = {}): Promise<Response> {
+  const { data } = await supabase.auth.getSession();
+  const token = data.session?.access_token;
+  const headers = new Headers(init.headers);
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+  if (init.body && !headers.has("Content-Type")) {
+    headers.set("Content-Type", "application/json");
+  }
+  return fetch(`${API_URL}${path}`, { ...init, headers });
+}
+
 export async function fetchDashboardData(): Promise<DashboardData> {
-  const res = await fetch(`${API_URL}/api/servers/status`);
+  const res = await apiFetch(`/api/servers/status`);
   if (!res.ok) throw new Error("Failed to fetch from backend");
   return await res.json();
 }
 
 export async function fetchAllAlerts(): Promise<Alert[]> {
-  const res = await fetch(`${API_URL}/api/alerts`);
+  const res = await apiFetch(`/api/alerts`);
   if (!res.ok) throw new Error("Failed to fetch alerts");
   return await res.json();
 }
 
 export async function resolveAlert(alertId: string): Promise<boolean> {
   try {
-    const res = await fetch(`${API_URL}/api/alerts/${alertId}/resolve`, {
+    const res = await apiFetch(`/api/alerts/${alertId}/resolve`, {
       method: "PATCH",
     });
     return res.ok;
@@ -86,13 +106,13 @@ export async function resolveAlert(alertId: string): Promise<boolean> {
 }
 
 export async function fetchCloudStatus(): Promise<CloudStatus> {
-  const res = await fetch(`${API_URL}/api/cloud/status`);
+  const res = await apiFetch(`/api/cloud/status`);
   if (!res.ok) throw new Error("Failed to fetch cloud status");
   return await res.json();
 }
 
 export async function triggerCostSync(): Promise<SyncResult> {
-  const res = await fetch(`${API_URL}/api/cloud/sync`, { method: "POST" });
+  const res = await apiFetch(`/api/cloud/sync`, { method: "POST" });
   if (!res.ok) {
     let detail = `Sync failed (${res.status})`;
     try {
@@ -108,9 +128,9 @@ export async function triggerCostSync(): Promise<SyncResult> {
 
 export async function triggerResourceDiscovery(region?: string): Promise<DiscoveryResult> {
   const url = region
-    ? `${API_URL}/api/cloud/discover?region=${encodeURIComponent(region)}`
-    : `${API_URL}/api/cloud/discover`;
-  const res = await fetch(url, { method: "POST" });
+    ? `/api/cloud/discover?region=${encodeURIComponent(region)}`
+    : `/api/cloud/discover`;
+  const res = await apiFetch(url, { method: "POST" });
   if (!res.ok) {
     let detail = `Discovery failed (${res.status})`;
     try {
@@ -125,14 +145,14 @@ export async function triggerResourceDiscovery(region?: string): Promise<Discove
 }
 
 export async function fetchLatestInsight(): Promise<WeeklyInsight | null> {
-  const res = await fetch(`${API_URL}/api/insights/latest`);
+  const res = await apiFetch(`/api/insights/latest`);
   if (res.status === 404) return null;
   if (!res.ok) throw new Error("Failed to fetch weekly insight");
   return await res.json();
 }
 
 export async function generateInsight(): Promise<InsightGenerateResult> {
-  const res = await fetch(`${API_URL}/api/insights/generate`, { method: "POST" });
+  const res = await apiFetch(`/api/insights/generate`, { method: "POST" });
   if (!res.ok) {
     let detail = `Generation failed (${res.status})`;
     try {
@@ -152,7 +172,7 @@ export async function updateServerStatus(serverId: string, status: string, userI
     if (userId) params.set("user_id", userId);
     if (orgId) params.set("org_id", orgId);
     const qs = params.toString() ? `?${params.toString()}` : "";
-    const res = await fetch(`${API_URL}/api/servers/${serverId}/status${qs}`, {
+    const res = await apiFetch(`/api/servers/${serverId}/status${qs}`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ status }),
@@ -178,7 +198,7 @@ export async function terminateServer(
     if (userId) params.set("user_id", userId);
     if (orgId) params.set("org_id", orgId);
     const qs = params.toString() ? `?${params.toString()}` : "";
-    const res = await fetch(`${API_URL}/api/servers/${serverId}${qs}`, {
+    const res = await apiFetch(`/api/servers/${serverId}${qs}`, {
       method: "DELETE",
       headers: { "Content-Type": "application/json" },
     });
@@ -225,15 +245,15 @@ export async function fetchAnomalyEvents(params?: {
   if (params?.resolved !== undefined) query.set("resolved", String(params.resolved));
 
   const qs = query.toString();
-  const url = qs ? `${API_URL}/api/anomalies?${qs}` : `${API_URL}/api/anomalies`;
-  const res = await fetch(url);
+  const url = qs ? `/api/anomalies?${qs}` : `/api/anomalies`;
+  const res = await apiFetch(url);
   if (!res.ok) return [];
   return await res.json();
 }
 
 export async function resolveAnomalyEvent(eventId: string): Promise<boolean> {
   try {
-    const res = await fetch(`${API_URL}/api/anomalies/${eventId}/resolve`, {
+    const res = await apiFetch(`/api/anomalies/${eventId}/resolve`, {
       method: "PATCH",
     });
     return res.ok;
@@ -245,7 +265,7 @@ export async function resolveAnomalyEvent(eventId: string): Promise<boolean> {
 
 export async function fetchServerBaseline(serverId: string): Promise<ServerBaselineInfo | null> {
   try {
-    const res = await fetch(`${API_URL}/api/anomalies/baseline/${serverId}`);
+    const res = await apiFetch(`/api/anomalies/baseline/${serverId}`);
     if (!res.ok) return null;
     return await res.json();
   } catch (error) {
@@ -260,7 +280,7 @@ export async function fetchServerBaseline(serverId: string): Promise<ServerBasel
 
 export async function fetchOptimizationSummary(): Promise<OptimizationSummary | null> {
   try {
-    const res = await fetch(`${API_URL}/api/optimization/summary`);
+    const res = await apiFetch(`/api/optimization/summary`);
     if (!res.ok) return null;
     return await res.json();
   } catch (error) {
@@ -287,8 +307,8 @@ export async function fetchOptimizationRecommendations(filters?: {
     if (filters?.status) query.set("status", filters.status);
 
     const qs = query.toString();
-    const url = qs ? `${API_URL}/api/optimization/recommendations?${qs}` : `${API_URL}/api/optimization/recommendations`;
-    const res = await fetch(url);
+    const url = qs ? `/api/optimization/recommendations?${qs}` : `/api/optimization/recommendations`;
+    const res = await apiFetch(url);
     if (!res.ok) return [];
     return await res.json();
   } catch (error) {
@@ -304,7 +324,7 @@ export async function triggerOptimizationAnalysis(): Promise<{
   recommendations: OptimizationRecommendation[];
 } | null> {
   try {
-    const res = await fetch(`${API_URL}/api/optimization/analyze`, { method: "POST" });
+    const res = await apiFetch(`/api/optimization/analyze`, { method: "POST" });
     if (!res.ok) throw new Error("Failed to trigger optimization analysis");
     return await res.json();
   } catch (error) {
@@ -318,7 +338,7 @@ export async function updateRecommendationStatus(
   status: "active" | "applied" | "dismissed"
 ): Promise<boolean> {
   try {
-    const res = await fetch(`${API_URL}/api/optimization/recommendations/${recommendationId}/status`, {
+    const res = await apiFetch(`/api/optimization/recommendations/${recommendationId}/status`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ status }),
@@ -337,9 +357,9 @@ export async function updateRecommendationStatus(
 export async function fetchIncidents(statusFilter?: string): Promise<Incident[]> {
   try {
     const url = statusFilter && statusFilter !== "all"
-      ? `${API_URL}/api/incidents?status=${statusFilter}`
-      : `${API_URL}/api/incidents`;
-    const res = await fetch(url);
+      ? `/api/incidents?status=${statusFilter}`
+      : `/api/incidents`;
+    const res = await apiFetch(url);
     if (!res.ok) return [];
     return await res.json();
   } catch (error) {
@@ -350,7 +370,7 @@ export async function fetchIncidents(statusFilter?: string): Promise<Incident[]>
 
 export async function fetchIncidentDetail(incidentId: string): Promise<Incident | null> {
   try {
-    const res = await fetch(`${API_URL}/api/incidents/${incidentId}`);
+    const res = await apiFetch(`/api/incidents/${incidentId}`);
     if (!res.ok) return null;
     return await res.json();
   } catch (error) {
@@ -366,7 +386,7 @@ export async function updateIncidentStatus(
   resolutionNotes?: string
 ): Promise<Incident | null> {
   try {
-    const res = await fetch(`${API_URL}/api/incidents/${incidentId}/status`, {
+    const res = await apiFetch(`/api/incidents/${incidentId}/status`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ status, actor, resolution_notes: resolutionNotes }),
@@ -385,7 +405,7 @@ export async function addIncidentNote(
   noteText: string
 ): Promise<IncidentNote | null> {
   try {
-    const res = await fetch(`${API_URL}/api/incidents/${incidentId}/notes`, {
+    const res = await apiFetch(`/api/incidents/${incidentId}/notes`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ author_name: authorName, note_text: noteText }),
@@ -400,7 +420,7 @@ export async function addIncidentNote(
 
 export async function triggerIncidentInvestigation(incidentId: string): Promise<AIInvestigation | null> {
   try {
-    const res = await fetch(`${API_URL}/api/incidents/${incidentId}/investigate`, {
+    const res = await apiFetch(`/api/incidents/${incidentId}/investigate`, {
       method: "POST",
     });
     if (!res.ok) return null;
@@ -417,7 +437,7 @@ export async function triggerIncidentInvestigation(incidentId: string): Promise<
 
 export async function fetchAlertRules(): Promise<AlertRule[]> {
   try {
-    const res = await fetch(`${API_URL}/api/alerts/rules`);
+    const res = await apiFetch(`/api/alerts/rules`);
     if (!res.ok) return [];
     return await res.json();
   } catch (error) {
@@ -428,7 +448,7 @@ export async function fetchAlertRules(): Promise<AlertRule[]> {
 
 export async function saveAlertRule(rule: Partial<AlertRule>): Promise<AlertRule | null> {
   try {
-    const res = await fetch(`${API_URL}/api/alerts/rules`, {
+    const res = await apiFetch(`/api/alerts/rules`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(rule),
@@ -443,7 +463,7 @@ export async function saveAlertRule(rule: Partial<AlertRule>): Promise<AlertRule
 
 export async function deleteAlertRule(ruleId: string): Promise<boolean> {
   try {
-    const res = await fetch(`${API_URL}/api/alerts/rules/${ruleId}`, {
+    const res = await apiFetch(`/api/alerts/rules/${ruleId}`, {
       method: "DELETE",
     });
     return res.ok;
@@ -455,7 +475,7 @@ export async function deleteAlertRule(ruleId: string): Promise<boolean> {
 
 export async function fetchNotificationChannels(): Promise<NotificationChannel[]> {
   try {
-    const res = await fetch(`${API_URL}/api/alerts/channels`);
+    const res = await apiFetch(`/api/alerts/channels`);
     if (!res.ok) return [];
     return await res.json();
   } catch (error) {
@@ -466,7 +486,7 @@ export async function fetchNotificationChannels(): Promise<NotificationChannel[]
 
 export async function saveNotificationChannel(channel: Partial<NotificationChannel>): Promise<NotificationChannel | null> {
   try {
-    const res = await fetch(`${API_URL}/api/alerts/channels`, {
+    const res = await apiFetch(`/api/alerts/channels`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(channel),
@@ -481,7 +501,7 @@ export async function saveNotificationChannel(channel: Partial<NotificationChann
 
 export async function deleteNotificationChannel(channelId: string): Promise<boolean> {
   try {
-    const res = await fetch(`${API_URL}/api/alerts/channels/${channelId}`, {
+    const res = await apiFetch(`/api/alerts/channels/${channelId}`, {
       method: "DELETE",
     });
     return res.ok;
@@ -497,7 +517,7 @@ export async function testNotificationChannel(channelId: string): Promise<{
   error_message?: string | null;
 } | null> {
   try {
-    const res = await fetch(`${API_URL}/api/alerts/channels/${channelId}/test`, {
+    const res = await apiFetch(`/api/alerts/channels/${channelId}/test`, {
       method: "POST",
     });
     if (!res.ok) return null;
@@ -511,9 +531,9 @@ export async function testNotificationChannel(channelId: string): Promise<{
 export async function fetchNotificationLogs(incidentId?: string): Promise<NotificationLog[]> {
   try {
     const url = incidentId
-      ? `${API_URL}/api/alerts/logs?incident_id=${incidentId}`
-      : `${API_URL}/api/alerts/logs`;
-    const res = await fetch(url);
+      ? `/api/alerts/logs?incident_id=${incidentId}`
+      : `/api/alerts/logs`;
+    const res = await apiFetch(url);
     if (!res.ok) return [];
     return await res.json();
   } catch (error) {
@@ -528,7 +548,7 @@ export async function fetchNotificationLogs(incidentId?: string): Promise<Notifi
 
 export async function initiateAWSConnection(region: string = "us-east-1"): Promise<AWSConnectionInitiateResult | null> {
   try {
-    const res = await fetch(`${API_URL}/api/aws/connections/initiate`, {
+    const res = await apiFetch(`/api/aws/connections/initiate`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ region }),
@@ -543,7 +563,7 @@ export async function initiateAWSConnection(region: string = "us-east-1"): Promi
 
 export async function fetchAWSConnections(): Promise<AWSConnection[]> {
   try {
-    const res = await fetch(`${API_URL}/api/aws/connections`);
+    const res = await apiFetch(`/api/aws/connections`);
     if (!res.ok) return [];
     return await res.json();
   } catch (error) {
@@ -560,7 +580,7 @@ export async function saveAWSConnection(data: {
   aws_account_id?: string;
 }): Promise<AWSConnection | null> {
   try {
-    const res = await fetch(`${API_URL}/api/aws/connections`, {
+    const res = await apiFetch(`/api/aws/connections`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(data),
@@ -578,7 +598,7 @@ export async function saveAWSConnection(data: {
 
 export async function verifyAWSConnection(connectionId: string): Promise<AWSConnectionVerifyResult | null> {
   try {
-    const res = await fetch(`${API_URL}/api/aws/connections/${connectionId}/verify`, {
+    const res = await apiFetch(`/api/aws/connections/${connectionId}/verify`, {
       method: "POST",
     });
     if (!res.ok) return null;
@@ -595,7 +615,7 @@ export async function syncAWSConnection(connectionId: string): Promise<{
   discovery: DiscoveryResult;
 } | null> {
   try {
-    const res = await fetch(`${API_URL}/api/aws/connections/${connectionId}/sync`, {
+    const res = await apiFetch(`/api/aws/connections/${connectionId}/sync`, {
       method: "POST",
     });
     if (!res.ok) return null;
@@ -608,7 +628,7 @@ export async function syncAWSConnection(connectionId: string): Promise<{
 
 export async function deleteAWSConnection(connectionId: string): Promise<boolean> {
   try {
-    const res = await fetch(`${API_URL}/api/aws/connections/${connectionId}`, {
+    const res = await apiFetch(`/api/aws/connections/${connectionId}`, {
       method: "DELETE",
     });
     return res.ok;
@@ -620,7 +640,7 @@ export async function deleteAWSConnection(connectionId: string): Promise<boolean
 
 export async function fetchAWSConnectionHealth(connectionId: string): Promise<AWSHealthDiagnosticResult | null> {
   try {
-    const res = await fetch(`${API_URL}/api/aws/connections/${connectionId}/health`);
+    const res = await apiFetch(`/api/aws/connections/${connectionId}/health`);
     if (!res.ok) return null;
     return await res.json();
   } catch (error) {
@@ -638,7 +658,7 @@ export async function fetchOrganizations(userId?: string, userEmail?: string): P
     const params = new URLSearchParams();
     if (userId) params.append("user_id", userId);
     if (userEmail) params.append("user_email", userEmail);
-    const res = await fetch(`${API_URL}/api/organizations?${params.toString()}`);
+    const res = await apiFetch(`/api/organizations?${params.toString()}`);
     if (!res.ok) return [];
     return await res.json();
   } catch (error) {
@@ -657,7 +677,7 @@ export async function createOrganization(
     const params = new URLSearchParams();
     if (userId) params.append("user_id", userId);
     if (userEmail) params.append("user_email", userEmail);
-    const res = await fetch(`${API_URL}/api/organizations?${params.toString()}`, {
+    const res = await apiFetch(`/api/organizations?${params.toString()}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name, plan_tier: planTier }),
@@ -677,7 +697,7 @@ export async function fetchOrganization(orgId: string, userId?: string): Promise
   try {
     const params = new URLSearchParams();
     if (userId) params.append("user_id", userId);
-    const res = await fetch(`${API_URL}/api/organizations/${orgId}?${params.toString()}`);
+    const res = await apiFetch(`/api/organizations/${orgId}?${params.toString()}`);
     if (!res.ok) return null;
     return await res.json();
   } catch (error) {
@@ -694,7 +714,7 @@ export async function updateOrganization(
   try {
     const params = new URLSearchParams();
     if (userId) params.append("user_id", userId);
-    const res = await fetch(`${API_URL}/api/organizations/${orgId}?${params.toString()}`, {
+    const res = await apiFetch(`/api/organizations/${orgId}?${params.toString()}`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(updates),
@@ -711,7 +731,7 @@ export async function deleteOrganization(orgId: string, userId?: string): Promis
   try {
     const params = new URLSearchParams();
     if (userId) params.append("user_id", userId);
-    const res = await fetch(`${API_URL}/api/organizations/${orgId}?${params.toString()}`, {
+    const res = await apiFetch(`/api/organizations/${orgId}?${params.toString()}`, {
       method: "DELETE",
     });
     return res.ok;
@@ -723,7 +743,7 @@ export async function deleteOrganization(orgId: string, userId?: string): Promis
 
 export async function fetchOrgMembers(orgId: string): Promise<OrganizationMember[]> {
   try {
-    const res = await fetch(`${API_URL}/api/organizations/${orgId}/members`);
+    const res = await apiFetch(`/api/organizations/${orgId}/members`);
     if (!res.ok) return [];
     return await res.json();
   } catch (error) {
@@ -743,7 +763,7 @@ export async function inviteOrgMember(
     const params = new URLSearchParams();
     if (userId) params.append("user_id", userId);
     if (userEmail) params.append("user_email", userEmail);
-    const res = await fetch(`${API_URL}/api/organizations/${orgId}/members?${params.toString()}`, {
+    const res = await apiFetch(`/api/organizations/${orgId}/members?${params.toString()}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ email, role }),
@@ -770,7 +790,7 @@ export async function updateOrgMemberRole(
     const params = new URLSearchParams();
     if (userId) params.append("user_id", userId);
     if (userEmail) params.append("user_email", userEmail);
-    const res = await fetch(`${API_URL}/api/organizations/${orgId}/members/${memberId}?${params.toString()}`, {
+    const res = await apiFetch(`/api/organizations/${orgId}/members/${memberId}?${params.toString()}`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ role }),
@@ -793,7 +813,7 @@ export async function removeOrgMember(
     const params = new URLSearchParams();
     if (userId) params.append("user_id", userId);
     if (userEmail) params.append("user_email", userEmail);
-    const res = await fetch(`${API_URL}/api/organizations/${orgId}/members/${memberId}?${params.toString()}`, {
+    const res = await apiFetch(`/api/organizations/${orgId}/members/${memberId}?${params.toString()}`, {
       method: "DELETE",
     });
     return res.ok;
@@ -815,7 +835,7 @@ export async function fetchAuditLogs(
       offset: offset.toString(),
     });
     if (action) params.append("action", action);
-    const res = await fetch(`${API_URL}/api/organizations/${orgId}/audit-logs?${params.toString()}`);
+    const res = await apiFetch(`/api/organizations/${orgId}/audit-logs?${params.toString()}`);
     if (!res.ok) return [];
     return await res.json();
   } catch (error) {
@@ -826,7 +846,7 @@ export async function fetchAuditLogs(
 
 export async function fetchOrgUsage(orgId: string): Promise<OrganizationUsage | null> {
   try {
-    const res = await fetch(`${API_URL}/api/organizations/${orgId}/usage`);
+    const res = await apiFetch(`/api/organizations/${orgId}/usage`);
     if (!res.ok) return null;
     return await res.json();
   } catch (error) {

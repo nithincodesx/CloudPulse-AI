@@ -42,6 +42,7 @@ from database import (
     get_server,
     get_aws_connection,
     list_aws_connections_for_org,
+    list_organizations_for_user,
 )
 from logging_conf import get_logger
 from tenant_service import verify_permission
@@ -110,6 +111,11 @@ def verify_supabase_jwt(token: str) -> dict[str, Any]:
         token,
         SUPABASE_JWT_SECRET,
         algorithms=["HS256"],
+        # Supabase user access tokens always carry aud="authenticated".
+        # Passing the expected audience is required: PyJWT rejects any
+        # token that *has* an aud claim when no audience is supplied,
+        # which would 401 every real sign-in.
+        audience="authenticated",
         options={
             "require": ["exp", "sub"],
             "leeway": JWT_LEEWAY_SECONDS,

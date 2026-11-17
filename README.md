@@ -1,50 +1,111 @@
 # CloudPulse AI ☁️⚡
 
-**Autonomous Cloud Infrastructure Cost & Resource Monitoring Dashboard**
+**Know what your cloud is doing — and what it's costing you.**
 
-An enterprise-grade, SaaS-style dashboard that tracks real-time server utilization, flags budget anomalies, detects idle or over-provisioned infrastructure, and logs telemetry data to Supabase.
+CloudPulse AI is a monitoring dashboard for cloud infrastructure. It watches
+your servers in real time, pulls your *real* AWS bill, flags waste and
+anomalies, and turns incidents into a workflow — all scoped per workspace,
+so a team only ever sees its own infrastructure.
+
+No fabricated numbers, ever: costs are either real AWS Cost Explorer data or
+an honest `$0` with a "connect your account" prompt.
 
 ---
 
-## Architecture
+## 📸 Screenshots
+
+*Captured from a local run with sample fleet data — the UI, layout and
+computed numbers are the real app's.*
+
+**Overview dashboard** — fleet KPIs, live utilization chart, active alerts
+
+![Dashboard](docs/screenshots/dashboard.svg)
+
+**Cost Analytics** — connected AWS account, AI weekly summary, run rates
+
+![Cost Analytics](docs/screenshots/cost-analytics.svg)
+
+**Fleet Inventory** — every node with source, status and live metrics
+
+![Fleet Inventory](docs/screenshots/fleet.svg)
+
+**Cost Optimization** — waste findings with estimated monthly savings
+
+![Cost Optimization](docs/screenshots/optimization.svg)
+
+**Incident Center** — incidents with severity, status and AI investigation
+
+![Incident Center](docs/screenshots/incidents.svg)
+
+---
+
+## ✨ What you get
+
+| Area | What's inside |
+|---|---|
+| **Live fleet monitoring** | CPU / RAM / network / disk telemetry every few seconds, KPI cards, per-server charts, 5-second auto-refresh |
+| **Real AWS costs** | Daily spend from AWS Cost Explorer, month-to-date + projected run rate, breakdowns by account, service, region and server |
+| **Cost optimization** | Rightsizing and idle-resource recommendations with estimated monthly savings |
+| **Anomaly detection** | Per-server rolling 7-day baselines with z-score detection — statistics, honestly labelled, not "ML magic" |
+| **Alerts & incidents** | Configurable alert rules, webhook/email notification channels, incident lifecycle with notes, timeline and AI-assisted investigation |
+| **Weekly AI summary** | A plain-English recap of the week's usage, spend and alerts (free-tier Groq or Gemini) |
+| **Multi-tenant workspaces** | Organizations with OWNER / ADMIN / MEMBER / VIEWER roles, member invites, audit log and usage metering |
+| **AWS auto-discovery** | Connect an AWS account once (cross-account IAM role) and EC2 / RDS / Lambda resources appear automatically |
+
+---
+
+## 🏗️ How it works
 
 ```
-┌─────────────────┐   POST /api/metrics         ┌──────────────┐
-│  Telemetry Agent │   Bearer <ingestion_token>  │  FastAPI     │
-│  (psutil /host)  │ ───────────────────────────▶│  Backend     │
-└─────────────────┘    (rate-limited)            │ (service key)│
-                                                └──────┬───────┘
-                                                       │
-                                                       ▼
-                                               ┌──────────────┐
-                                               │  Supabase    │
-                                               │  Postgres    │
-                                               │  (RLS scoped │
-                                               │  to auth.uid)│
-                                               └──────┬───────┘
-                                                      ▲
-                                              anon key │ auth.uid() RLS
-                                                      │
-                                              ┌──────────────┐
-                                              │  Next.js      │
-                                              │  Dashboard    │
-                                              │ (Supabase Auth)│
-                                              └──────────────┘
+┌──────────────────┐  POST /api/metrics          ┌──────────────┐
+│ Telemetry Agent  │  Bearer <ingestion_token>   │   FastAPI    │
+│ (psutil, on your │ ───────────────────────────▶│   Backend    │
+│  servers)        │                             └──────┬───────┘
+└──────────────────┘                                    │ service key
+┌──────────────────┐  GET /api/*                        ▼
+│  Next.js         │  Bearer <Supabase JWT>      ┌──────────────┐
+│  Dashboard       │ ───────────────────────────▶│  Supabase    │
+│                  │                             │  Postgres    │
+└──────────────────┘                             └──────────────┘
+        ▲
+        │  AWS Cost Explorer + resource discovery (STS AssumeRole)
+┌──────────────────┐
+│   Your AWS       │
+│   account(s)     │
+└──────────────────┘
 ```
 
-## Quick Start
+Two separate security planes, by design:
 
-### 1. Supabase Setup
+1. **Dashboard plane** — every `/api/*` call carries your Supabase login
+   token. The backend verifies the JWT and scopes *all* data to your
+   workspace. No token → `401`. Another workspace's data → invisible.
+2. **Telemetry plane** — servers push metrics with their own per-node
+   ingestion token. A leaked node token can only write that node's
+   metrics; it can never read dashboard data.
 
-1. Create a Supabase project at [supabase.com](https://supabase.com)
-2. **Enable Auth → Providers → Email**: turn on the **Email** provider (with
-   "Confirm email" on for sign-up) — this powers both password sign-in and the
-   "Email me a sign-in link" magic-link flow.
-3. Open the **SQL Editor** and paste the contents of `supabase-schema.sql`
-   (creates the tables, `ingestion_token` defaults, and `auth.uid()`-scoped RLS
-   policies).
-4. Copy your project URL, anon key, and **service-role key** from
-   **Settings → API**.
+---
+
+## 🚀 Quick start
+
+You need: a free [Supabase](https://supabase.com) project, Python 3.11+,
+and Node 20+.
+
+### 1. Database (Supabase)
+
+1. Create a project at [supabase.com](https://supabase.com).
+2. **Authentication → Providers → Email**: enable the Email provider
+   (this powers password and magic-link sign-in).
+3. **SQL Editor**: paste and run [`supabase-schema.sql`](supabase-schema.sql).
+   That single file creates every table, function and security policy.
+   *(The `migrations/` folder holds the same changes as incremental steps,
+   only needed if you set up an early version of the schema.)*
+4. From **Settings → API**, note three values — you'll need them below:
+   - Project URL
+   - `anon` public key
+   - `service_role` secret key
+5. From **Settings → API → JWT Settings**, also note the **JWT Secret**.
+   The backend cannot verify logins without it.
 
 ### 2. Backend
 
@@ -52,94 +113,63 @@ An enterprise-grade, SaaS-style dashboard that tracks real-time server utilizati
 cd backend
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env   # fill in SUPABASE_URL, SUPABASE_SERVICE_KEY, CORS_ORIGINS, RATE_LIMIT_PER_MINUTE
+cp .env.example .env    # fill in SUPABASE_URL, SUPABASE_SERVICE_KEY, SUPABASE_JWT_SECRET
 uvicorn main:app --reload --port 8000
 ```
 
-> The backend stores everything in **Supabase Postgres** — there is no local
-> database. It reads `SUPABASE_URL` / `SUPABASE_SERVICE_KEY` from `.env` and will
-> refuse to start if Supabase is unreachable or `supabase-schema.sql` hasn't been
-> applied.
->
-> The **service-role key bypasses RLS** and must live only in `backend/.env` —
-> never expose it to the frontend. `CORS_ORIGINS` is a comma-separated list of
-> allowed browser origins (default `http://localhost:3000`), and
-> `RATE_LIMIT_PER_MINUTE` caps ingestion on `POST /api/metrics` (default `30`).
->
-> All AWS variables are **optional** — see the
-> [AWS Cost Explorer](#optional-aws-cost-explorer-integration) section. If they're
-> left unset, the dashboard runs in **simulated cost mode** (all cost figures show
-> `$0` with a connect prompt — never a fabricated estimate).
+Check it: [http://localhost:8000/health](http://localhost:8000/health)
+should return `{"status":"ok","database":"connected"}`.
 
-### 3. Telemetry Agent (separate terminal)
-
-```bash
-cd backend
-source .venv/bin/activate
-python telemetry_agent.py --token <INGESTION_TOKEN> --interval 5
-```
-
-> `--token` is the per-node ingestion token shown in the dashboard when you
-> provision a node (Fleet Management → Provision New Node → node details). The
-> agent authenticates with `Authorization: Bearer <token>`; unknown or missing
-> tokens are **rejected with HTTP 401** — servers are never auto-registered.
->
-> The agent reports **only real host metrics** (`cpu_usage`, `ram_usage`,
-> `network_traffic`). It does not compute or send any cost — spend comes from AWS
-> Cost Explorer on the backend when a cloud account is connected.
-
-### 4. Frontend
+### 3. Frontend
 
 ```bash
 cd frontend
-cp .env.local.example .env.local   # fill in Supabase URL, anon key, and NEXT_PUBLIC_API_URL
+cp .env.local.example .env.local   # Supabase URL, anon key, NEXT_PUBLIC_API_URL=http://localhost:8000
 npm install
 npm run dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) — you'll be asked to sign in.
-Create an account (or use a magic link), then provision a node from
-**Fleet Management** to get its ingestion token.
+Open [http://localhost:3000](http://localhost:3000), create an account, and
+you're in. A default workspace is created for you automatically.
 
-> The frontend now requires Supabase Auth to be enabled and real
-> `NEXT_PUBLIC_SUPABASE_URL` / `NEXT_PUBLIC_SUPABASE_ANON_KEY` values. Magic-link
-> sign-in redirects through `/auth/callback` to exchange the one-time code.
+### 4. Monitor a server (telemetry agent)
 
----
+In the dashboard go to **Fleet Inventory → Provision Node**. You'll get a
+node with its own ingestion token. On that server run:
 
-## Optional: AWS Cost Explorer integration
-
-By default the dashboard shows **real** month-to-date spend pulled from
-**AWS Cost Explorer** (the `ce:GetCostAndUsage` API) — **if** a read-only AWS
-account is configured. Without one it runs in **simulated cost mode** (see
-below). Cost figures are never estimated; they're either real Cost Explorer data
-or `$0`.
-
-### 1. Create a read-only IAM role
-
-Create an IAM user (or role) with a **read-only** policy — either the AWS managed
-policy `AWSBillingReadOnlyAccess`, or the minimal inline policy:
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    { "Effect": "Allow", "Action": "ce:GetCostAndUsage", "Resource": "*" }
-  ]
-}
+```bash
+pip install psutil httpx
+python backend/telemetry_agent.py --token <INGESTION_TOKEN> --url http://localhost:8000 --interval 5
 ```
 
-This works on a free-tier account; billing data access requires no paid Cost
-Explorer tier.
+The agent reports real host metrics only (CPU, RAM, network, disk, uptime).
+Unknown tokens are rejected with `401` — servers are never auto-registered.
 
-### 2. Tag your cost-bearing resources
+### 5. Connect AWS (optional, for real costs)
 
-Cost Explorer reports cost per resource **tag**. Tag the EC2/RDS/Lambda resources
-that belong to each monitored node with the key `server` (configurable via
-`AWS_COST_TAG_KEY`) and a **value matching the node's cost tag** — CloudPulse
-matches tag value → `cost_tag` first, then `server_name`, then `ip_address`.
+In the dashboard, open the **AWS connection wizard** and follow it:
 
-### 3. Set credentials in `backend/.env`
+1. CloudPulse generates a one-time **External ID** and a ready-made
+   CloudFormation link.
+2. Launch the stack in your AWS account — it creates a **read-only IAM
+   role** that CloudPulse can assume (STS AssumeRole, no access keys
+   stored).
+3. Paste the role ARN back, hit **Verify**, then **Sync**.
+
+From then on CloudPulse discovers your EC2/RDS/Lambda resources and pulls
+daily costs automatically. Until an account is connected, the dashboard
+runs in **simulated mode**: costs show `$0` with a connect prompt — never
+an invented estimate.
+
+> **Cost Explorer timing:** AWS cost data is daily and lags 24–48 hours.
+> "Hourly burn" in the UI is derived from the latest full day and labelled
+> as such.
+
+<details>
+<summary>Alternative: single-account mode via environment variables</summary>
+
+For a quick single-account setup you can skip the wizard and put read-only
+credentials in `backend/.env` instead:
 
 ```bash
 AWS_ACCESS_KEY_ID=AKIA...
@@ -148,214 +178,168 @@ AWS_REGION=us-east-1
 AWS_COST_TAG_KEY=server
 ```
 
-Credentials stay in `backend/.env` — they never enter the database or frontend.
-On startup (and via **Sync now** in the UI) the backend pulls the last 14 days of
-daily cost, upserts them into the `daily_costs` table, and derives:
-
-- **MTD spend** — sum of daily actuals for the current month
-- **Projected monthly run rate** — MTD ÷ elapsed days × days in month
-- **Hourly burn** — latest available day ÷ 24 (labeled **derived**)
-
-### ⚠️ Cost Explorer is daily and lags 24–48h
-
-There is no real per-hour cost. "Hourly burn" is derived from the latest daily
-total and labeled as such; today's spend appears tomorrow. On connection, a sync
-also flags **budget spikes** — a node whose latest daily cost exceeds 2× its
-14-day mean raises a `BUDGET_SPIKE` alert.
-
-### Simulated vs. real mode
-
-| State | Cost source | What the UI shows |
-|---|---|---|
-| AWS connected & synced | `daily_costs` from Cost Explorer | Real numbers + green **AWS · Real data** badge |
-| No cloud account | none | **$0** / `—` figures, amber **Simulated mode** badge, connect prompt with setup steps |
+The IAM policy only needs `ce:GetCostAndUsage`. Tag cost-bearing resources
+with the key `server` and a value matching the node's cost tag so spend is
+attributed per node.
+</details>
 
 ---
 
-## Statistical anomaly detection (rolling baseline, not ML)
+## 🔍 The honest parts (read this)
 
-The old hardcoded cutoffs (`CPU > 85`, `network > 500 MB`, …) are gone. The
-backend now computes a **rolling baseline** per server per metric — the mean and
-population stddev of the last `BASELINE_DAYS` (default 7) of `server_metrics` —
-as a Postgres aggregate (`metrics_baseline` RPC), and flags the latest sample by
-**z-score**:
+**Anomaly detection is statistics, not ML.** Each server gets a rolling
+7-day baseline (mean + standard deviation per metric). A new sample is
+flagged when its z-score crosses a threshold (CPU `3.0`, network `4.0` —
+network is burstier). Idle detection uses an absolute floor instead,
+because a chronically idle server has a flat baseline z-scores can't see.
+A server needs at least 10 samples before any claim is made.
 
-- **HIGH_CPU** — cpu z-score `> ANOMALY_Z_SCORE` (default 3.0), or the metric is
-  pegged at ~100% on a flat baseline → status `critical`
-- **NETWORK_ANOMALY** — network z-score `> NETWORK_Z_SCORE` (default 4.0 — a
-  separate, higher knob because network traffic is bursty) → status `warning`
-- **IDLE_RESOURCE** — cpu `< IDLE_CPU_FLOOR` **and** ram `< IDLE_RAM_FLOOR`
-  (defaults 5 / 10). Idle is an absolute low-utilization **floor**, not an
-  anomaly: a chronically idle node has a flat, already-low baseline that
-  z-scores can't see.
-
-Honesty rules baked in:
-- **Warmup**: a server needs ≥ `BASELINE_MIN_SAMPLES` (default 10) points in the
-  window before any z-score claim is made. No baseline ⇒ no claim.
-- **This is statistics, not ML.** There is no trained model; z-scores against a
-  rolling mean/stddev are classic statistical process control. The only "AI" is
-  the weekly summary (below), which *summarizes* these results and real cost
-  data — it never produces numbers itself.
-- Multiple anomalies on one ingest collapse to the most severe status
-  (`critical > warning > idle`).
-
-Config: `ANOMALY_Z_SCORE`, `NETWORK_Z_SCORE`, `BASELINE_DAYS`,
-`BASELINE_MIN_SAMPLES`, `IDLE_CPU_FLOOR`, `IDLE_RAM_FLOOR` in `backend/.env`
-(see `.env.example`).
-
-## Weekly AI summary (free-tier LLM)
-
-A scheduled job (APScheduler, weekly cron — default **Mon 09:00 UTC**, tunable
-via `WEEKLY_INSIGHT_DOW/HOUR/MINUTE/TZ`) gathers a week of **real** data and asks
-a free-tier LLM to write a plain-English recap:
-
-- per-server utilization (idle % from `metrics_utilization`, avg CPU/RAM)
-- real cost per server this week vs prior week (from `daily_costs`)
-- the week's alerts (type, server, message)
-
-…and stores the result in the `weekly_insights` table (idempotent on
-`period_start + period_end`). Example output: *"db-primary-01 was idle 40% of the
-time, costing ~$12 for nothing this week — consider downsizing."*
-
-### Providers (pick one — both are free-tier)
-
-| Provider | Env | Model |
-|---|---|---|
-| Groq | `GROQ_API_KEY` | `llama-3.1-8b-instant` (default) |
-| Gemini | `GEMINI_API_KEY` | `gemini-2.5-flash` (default) |
-
-`AI_PROVIDER` can be `groq`, `gemini`, or `auto` (default: Groq if its key is
-set, else Gemini). Override the model with `AI_MODEL`. No extra SDKs — both
-providers are called over HTTP with `httpx`.
-
-### Honesty
-
-- The LLM is a **summarizer, not a source of numbers** — every figure in its
-  prompt comes from telemetry / Cost Explorer / alerts, and the prompt forbids
-  inventing values.
-- The prompt (and the UI panel) state that anomaly detection is **statistical
-  z-scores, not ML**, and that Cost Explorer lags 24–48h.
-- Without a key the job reports *"LLM not configured"* — it never fabricates a
-  summary.
-
-### Triggering
-
-- **Scheduled**: weekly cron (see above).
-- **On demand**: `POST /api/insights/generate` (rate-limited to 2/min) — returns
-  a stored summary or a `503` with the real reason (unconfigured / bad key /
-  rate-limited).
-- **Read**: `GET /api/insights/latest` returns the most recent summary (404 when
-  none exists yet).
+**The AI summary only summarizes.** The weekly job hands a free-tier LLM
+(Groq `llama-3.1-8b-instant` or Gemini `gemini-2.5-flash`) real numbers
+from telemetry, Cost Explorer and alerts, and its prompt forbids inventing
+values. Without an API key it reports "LLM not configured" — it never
+fabricates a summary. Trigger it on demand with
+`POST /api/insights/generate`.
 
 ---
 
-## Deployment
+## 🔌 API reference
 
-### Local dev with Docker
+All dashboard endpoints require `Authorization: Bearer <Supabase JWT>`.
+The only public routes are `GET /health` and `POST /api/metrics`
+(per-node ingestion token).
+
+| Group | Endpoints |
+|---|---|
+| **Health** | `GET /health` |
+| **Telemetry** | `POST /api/metrics` · `GET /api/servers/{id}/metrics` · `POST /api/servers/sync-node` |
+| **Fleet** | `GET /api/servers/status` · `PUT /api/servers/{id}/status` · `DELETE /api/servers/{id}` |
+| **Cloud (legacy sync)** | `GET /api/cloud/status` · `POST /api/cloud/discover` · `POST /api/cloud/sync` |
+| **AWS connections** | `POST /api/aws/connections/initiate` · `GET/POST /api/aws/connections` · `GET/DELETE /api/aws/connections/{id}` · `POST …/{id}/verify` · `GET …/{id}/health` · `POST …/{id}/sync` |
+| **Workspaces & RBAC** | `GET/POST /api/organizations` · `GET/PUT/DELETE /api/organizations/{id}` · `GET/POST /api/organizations/{id}/members` · `PUT/DELETE /api/organizations/{id}/members/{member_id}` · `GET /api/organizations/{id}/audit-logs` · `GET /api/organizations/{id}/usage` |
+| **Costs** | `GET /api/costs/account` · `GET /api/costs/services` · `GET /api/costs/regions` · `GET /api/costs/trends/{server_id}` · `GET /api/costs/anomalies/{server_id}` |
+| **Alerts** | `GET /api/alerts` · `PATCH /api/alerts/{id}/resolve` |
+| **Alert rules & channels** | `GET/POST /api/alerts/rules` · `DELETE /api/alerts/rules/{id}` · `GET/POST /api/alerts/channels` · `DELETE /api/alerts/channels/{id}` · `POST /api/alerts/channels/{id}/test` · `GET /api/alerts/logs` |
+| **Anomalies** | `GET /api/anomalies` · `GET /api/anomalies/events` · `PATCH /api/anomalies/{id}/resolve` · `GET /api/anomalies/baseline/{server_id}` |
+| **Optimization** | `GET /api/optimization/summary` · `GET /api/optimization/recommendations` · `POST /api/optimization/analyze` · `PATCH /api/optimization/recommendations/{id}/status` |
+| **Incidents** | `GET /api/incidents` · `GET /api/incidents/{id}` · `PATCH /api/incidents/{id}/status` · `POST /api/incidents/{id}/notes` · `POST /api/incidents/{id}/investigate` |
+| **Insights** | `GET /api/insights/latest` · `POST /api/insights/generate` |
+
+Interactive docs: [http://localhost:8000/docs](http://localhost:8000/docs)
+while the backend is running.
+
+---
+
+## ⚙️ Configuration
+
+### Backend (`backend/.env` — see [`.env.example`](backend/.env.example))
+
+| Variable | Required | What it does |
+|---|---|---|
+| `SUPABASE_URL` | ✅ | Your Supabase project URL |
+| `SUPABASE_SERVICE_KEY` | ✅ | Service-role key (backend only — never ship to the frontend) |
+| `SUPABASE_JWT_SECRET` | ✅ | Verifies dashboard logins; without it every dashboard call returns 401 |
+| `CORS_ORIGINS` | | Comma-separated frontend origins (default `http://localhost:3000`) |
+| `RATE_LIMIT_PER_MINUTE` | | Ingestion rate limit per IP (default `30`) |
+| `GROQ_API_KEY` / `GEMINI_API_KEY` | | Weekly AI summary (pick one, both free-tier) |
+| `AI_PROVIDER` | | `groq`, `gemini`, or `auto` (default) |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | | Only for the legacy single-account cost mode |
+| `ANOMALY_Z_SCORE`, `NETWORK_Z_SCORE`, `BASELINE_DAYS`, … | | Detection tuning — defaults are sensible, see `.env.example` |
+| `SMTP_HOST`, `SMTP_USER`, `SMTP_PASS`, … | | Email notification channel |
+
+### Frontend (`frontend/.env.local`)
+
+| Variable | What it does |
+|---|---|
+| `NEXT_PUBLIC_SUPABASE_URL` | Same Supabase project URL |
+| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Anon public key (safe in the browser; data is protected by RLS + backend auth) |
+| `NEXT_PUBLIC_API_URL` | Backend URL the browser calls (inlined at build time — set it before deploying) |
+
+---
+
+## ☁️ Deployment
+
+**Docker (local full stack)**
 
 ```bash
-# backend/.env and frontend/.env.local must exist (copy the *.example files)
+# create backend/.env and frontend/.env.local first
 docker compose up --build
-# backend → http://localhost:8000   frontend → http://localhost:3000
+# backend → http://localhost:8000 · frontend → http://localhost:3000
 ```
 
-`NEXT_PUBLIC_API_URL` is a **browser-side** variable, so in the compose file it
-is `http://localhost:8000` (host-reachable), never a container hostname.
+**Backend → Render (free tier)**
+Use the shipped [`render.yaml`](render.yaml) Blueprint
+(**New → Blueprint → pick this repo**). Set `SUPABASE_URL`,
+`SUPABASE_SERVICE_KEY`, `SUPABASE_JWT_SECRET` and `CORS_ORIGINS`
+(your Vercel origin) in the Render dashboard. Note: free services sleep
+after ~15 min idle; `/health` doubles as the wake-up check.
 
-### Backend → Render (free tier)
+**Frontend → Vercel**
+Import the repo and set the project **Root Directory to `frontend`**
+(`frontend/vercel.json` is included). Set the three `NEXT_PUBLIC_*`
+variables for Production — `NEXT_PUBLIC_API_URL` must be your Render URL,
+and it is baked in at build time, so set it *before* deploying.
 
-The repo ships a [`render.yaml`](render.yaml) Blueprint: **New → Blueprint →
-pick `nithincodesx/CloudPulse-AI`**. It builds `backend/Dockerfile` (non-root,
-`python:3.13-slim`), sets `healthCheckPath: /health`, and auto-deploys on push
-to `main`.
-
-Set these in the Render dashboard (Service → Environment — they are **not** in
-git):
-
-| Variable | Notes |
-|---|---|
-| `SUPABASE_URL` | Required — your Supabase project URL |
-| `SUPABASE_SERVICE_KEY` | Required — service-role key (never exposed to the frontend) |
-| `CORS_ORIGINS` | Your deployed Vercel origin, e.g. `https://cloudpulse-ai.vercel.app` |
-| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | Optional — real cost data |
-| `GROQ_API_KEY` / `GEMINI_API_KEY` / `AI_PROVIDER` | Optional — weekly AI summary |
-
-> **Free-tier caveat:** Render free services sleep after ~15 min idle. The first
-> request after a gap triggers a cold start (a few seconds); Render's `/health`
-> ping doubles as the wake check.
-
-### Frontend → Vercel
-
-Import the repo in Vercel (it auto-detects Next.js). Set the environment
-variables (Production):
-
-```
-NEXT_PUBLIC_SUPABASE_URL=
-NEXT_PUBLIC_SUPABASE_ANON_KEY=
-NEXT_PUBLIC_API_URL=https://<your-render-app>.onrender.com
-```
-
-`NEXT_PUBLIC_API_URL` is inlined at build time — set it before every deploy
-(it's the Render URL, **not** `localhost:8000`). The frontend fails fast at
-build/runtime if it's missing; there is no silent localhost fallback.
-
-### Database → Supabase (free tier)
-
-Already in place — `supabase-schema.sql` in the SQL Editor, RLS scoped to
-`auth.uid()`, backend access via the service-role key. Nothing to migrate.
-
-### CI (GitHub Actions)
-
-`.github/workflows/ci.yml` runs on every push/PR to `main`:
-- **Backend**: `pytest` (DB-free unit tests in `backend/tests/` — pure logic
-  only; integration tests needing real Supabase/AWS/LLM secrets are documented
-  as excluded).
-- **Frontend**: `npm ci` → `npm run build` (dummy public env vars) → Playwright
-  chromium smoke test (`/login` renders, `/` returns 200).
-
-### Health & logs
-
-- `GET /health` → `200 {"status":"ok","database":"connected"}` when Supabase is
-  reachable, else `503`. Used by Render's health check.
-- Logging is **structured** (structlog): JSON lines in production, colored
-  console in local dev. `LOG_LEVEL` (default `INFO`) tunes verbosity.
+**Database → Supabase (free tier)** — already done in step 1 of Quick start.
 
 ---
 
-## Features
+## 🧪 Testing & CI
 
-| Feature | Description |
+```bash
+cd backend && pip install -r requirements-dev.txt && python -m pytest
+cd frontend && npm run build && npm run test:e2e
+```
+
+- **183 backend tests**, no setup needed — the suite runs fully offline
+  with dummy credentials (`backend/tests/conftest.py`). It includes an
+  API smoke test (`test_api_smoke.py`) that drives **every route**
+  end-to-end and fails on any 500.
+- **Frontend**: production build + a Playwright smoke test.
+- **GitHub Actions** (`.github/workflows/ci.yml`) runs both on every
+  push/PR to `main`.
+
+---
+
+## 📁 Project structure
+
+```
+CloudPulse-AI/
+├── backend/               FastAPI app
+│   ├── main.py            API routes (60 endpoints)
+│   ├── auth.py            JWT verification + workspace RBAC
+│   ├── database.py        Supabase data layer (tenant-scoped helpers)
+│   ├── anomaly.py         Rolling-baseline anomaly detection
+│   ├── aws_*.py           Cost Explorer, STS credentials, discovery, sync
+│   ├── cost_optimizer.py  Rightsizing / waste recommendations
+│   ├── insights.py        Weekly AI summary job
+│   ├── telemetry_agent.py The agent you run on monitored servers
+│   └── tests/             Pytest suite (incl. full-route smoke tests)
+├── frontend/              Next.js dashboard
+│   └── src/
+│       ├── app/           Pages: fleet, costs, optimization, incidents, alerts, settings
+│       ├── components/    Sidebar, charts, AWS wizard, workspace switcher…
+│       └── lib/           Authenticated API client, types, contexts
+├── docs/screenshots/      Demo screenshots used in this README
+├── supabase-schema.sql    Complete database schema (run once in Supabase)
+├── migrations/            The same schema as incremental steps (existing installs)
+├── docker-compose.yml     Local full-stack dev
+└── render.yaml            Render Blueprint for the backend
+```
+
+---
+
+## 🛠️ Troubleshooting
+
+| Symptom | Likely cause |
 |---|---|
-| **Supabase Auth** | Email/password sign-in and magic-link sign-in gating the dashboard |
-| **Per-node provisioning** | Provision a node from the UI; each server gets a unique 256-bit ingestion token |
-| **Token-based ingestion** | Telemetry agent authenticates with `Authorization: Bearer <token>`; unknown tokens → 401 |
-| **RLS-scoped data** | Postgres RLS policies restrict servers/metrics/alerts to the owning `auth.uid()` |
-| **Rate-limited ingestion** | `POST /api/metrics` throttled via slowapi (`RATE_LIMIT_PER_MINUTE`) |
-| **Restricted CORS** | Backend only accepts browser origins listed in `CORS_ORIGINS` |
-| **Real-time KPI cards** | Active nodes, avg CPU, monthly spend, alert count |
-| **Interactive charts** | CPU & RAM area chart with per-server filtering |
-| **Live alert feed** | HIGH_CPU, IDLE_RESOURCE, BUDGET_SPIKE alerts with dismiss |
-| **Statistical anomaly detection** | Per-server rolling 7-day baseline, z-score flags — honest that it's not ML |
-| **Weekly AI summary** | Scheduled job summarizes real alerts + cost deltas via free-tier Groq/Gemini |
-| **AWS Cost Explorer** | Read-only integration pulls real daily spend per resource tag |
-| **Honest cost modes** | Real data with a green badge, or simulated mode showing `$0` + connect prompt — never fabricated numbers |
-| **Budget spike detection** | Real daily-cost spikes (>2× 14-day mean) raise BUDGET_SPIKE alerts |
-| **Cost optimization table** | Per-node breakdown with projected savings from real spend |
-| **5s auto-refresh** | Dashboard polls for updates every 5 seconds |
+| Every dashboard page 401s / empty | `SUPABASE_JWT_SECRET` missing or wrong in `backend/.env` — the backend fails closed by design |
+| Costs all show `$0` | No AWS account connected yet (simulated mode), or Cost Explorer's 24–48h lag — connect an account and Sync |
+| Agent gets `401` | Wrong ingestion token — copy it again from the node's details in Fleet Inventory |
+| Backend won't start | Supabase unreachable or schema not applied — re-run `supabase-schema.sql` and check `SUPABASE_URL` / `SUPABASE_SERVICE_KEY` |
+| Frontend points at the wrong backend | `NEXT_PUBLIC_API_URL` is baked in at build time — fix it and rebuild/redeploy |
 
-## API Endpoints
+---
 
-| Method | Path | Description |
-|---|---|---|
-| `POST` | `/api/metrics` | Ingest telemetry payload (`Bearer <ingestion_token>`, rate-limited) |
-| `GET` | `/api/servers/status` | Aggregated server view (incl. real daily costs & cloud status) |
-| `GET` | `/api/servers/{id}/metrics` | Historical metrics for one server |
-| `GET` | `/api/cloud/status` | AWS Cost Explorer connection status |
-| `POST` | `/api/cloud/sync` | Pull daily cost from Cost Explorer & flag budget spikes |
-| `GET` | `/api/insights/latest` | Most recent weekly AI summary (404 when none) |
-| `POST` | `/api/insights/generate` | Generate the weekly AI summary on demand (rate-limited) |
-| `GET` | `/health` | Health check |
-
-> Backend dashboard endpoints (`GET /api/servers/*`) are intentionally left open
-> — access is gated at the UI layer. Direct data access for the signed-in
-> frontend (e.g. provisioning servers) is protected by RLS via the anon key.
+Built with FastAPI, Next.js, Supabase and AWS — designed to tell you the
+truth about your infrastructure, including when the truth is "no data yet".

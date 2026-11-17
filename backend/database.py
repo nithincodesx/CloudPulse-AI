@@ -13,7 +13,7 @@ import os
 import re
 import uuid
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 
 from dotenv import load_dotenv
 from supabase import Client, create_client
@@ -600,12 +600,22 @@ def get_latest_cost_date() -> str | None:
 # Alerts
 # ---------------------------------------------------------------------------
 
-def list_alerts(unresolved_only: bool = True) -> list[dict]:
+def _org_server_ids(org_id: str) -> list[str]:
+    """Server ids belonging to an organization (tenant-scope helper)."""
+    return [str(s["id"]) for s in list_servers_for_org(org_id) if s.get("id")]
+
+
+def list_alerts(unresolved_only: bool = True, org_id: Optional[str] = None) -> list[dict]:
     """Return alerts, newest first, with the owning server's name embedded.
 
     Degrades to an empty feed on transient Supabase errors so a network blip
     can never 500 the dashboard (matches list_servers / latest_metrics).
+
+    When ``org_id`` is given the feed is tenant-scoped to that
+    organization's servers (see ``list_alerts_for_servers``).
     """
+    if org_id:
+        return list_alerts_for_servers(_org_server_ids(org_id), unresolved_only=unresolved_only)
     try:
         query = _supabase.table("system_alerts").select("*, servers(server_name)")
         if unresolved_only:
@@ -648,8 +658,17 @@ def insert_alert(payload: dict) -> dict:
     return row
 
 
-def resolve_alert(alert_id: str) -> dict:
-    """Mark an alert as resolved. Returns the updated row, or {} when missing."""
+def resolve_alert(alert_id: str, org_id: Optional[str] = None) -> dict:
+    """Mark an alert as resolved. Returns the updated row, or {} when missing.
+
+    When ``org_id`` is given, an alert whose server belongs to another
+    organization is treated as missing ({}), so existence is not leaked
+    across tenants.
+    """
+    if org_id:
+        existing = get_alert(alert_id)
+        if not existing or str(existing.get("server_id")) not in _org_server_ids(org_id):
+            return {}
     _supabase.table("system_alerts").update({"resolved": True}).eq("id", alert_id).execute()
 
     rows = (
@@ -724,8 +743,17 @@ def list_anomaly_events(
     severity: Optional[str] = None,
     resolved: Optional[bool] = None,
     limit: int = 50,
+    org_id: Optional[str] = None,
 ) -> list[dict]:
-    """Return anomaly events, newest first, with optional filters."""
+    """Return anomaly events, newest first, with optional filters.
+
+    When ``org_id`` is given the feed is tenant-scoped to that
+    organization's servers (see ``list_anomaly_events_for_servers``).
+    """
+    if org_id:
+        return list_anomaly_events_for_servers(
+            _org_server_ids(org_id), severity=severity, resolved=resolved, limit=limit
+        )
     try:
         query = _supabase.table("anomaly_events").select("*, servers(server_name)")
         if server_id:
@@ -750,8 +778,16 @@ def list_anomaly_events(
         return []
 
 
-def resolve_anomaly_event(event_id: str) -> dict:
-    """Mark an anomaly event as resolved."""
+def resolve_anomaly_event(event_id: str, org_id: Optional[str] = None) -> dict:
+    """Mark an anomaly event as resolved.
+
+    When ``org_id`` is given, an event whose server belongs to another
+    organization is treated as missing ({}).
+    """
+    if org_id:
+        existing = get_anomaly_event(event_id)
+        if not existing or str(existing.get("server_id")) not in _org_server_ids(org_id):
+            return {}
     try:
         _supabase.table("anomaly_events").update({"resolved": True}).eq("id", event_id).execute()
         row = _supabase.table("anomaly_events").select("*").eq("id", event_id).limit(1).execute().data
@@ -815,8 +851,33 @@ def list_optimization_recommendations(
     recommendation_type: Optional[str] = None,
     status: Optional[str] = "active",
     limit: int = 50,
+    org_id: Optional[str] = None,
 ) -> list[dict]:
-    """Fetch optimization recommendations matching filters."""
+    """Fetch optimization recommendations matching filters.
+
+    When ``org_id`` is given the list is tenant-scoped (organization
+    column or per-server ownership — see
+    ``list_optimization_recommendations_for_servers``).
+    """
+    if org_id:
+        rows = list_optimization_recommendations_for_servers(
+            _org_server_ids(org_id),
+            organization_id=org_id,
+            service_name=service_name,
+            region=region,
+            severity=severity,
+            recommendation_type=recommendation_type,
+            status=status,
+            limit=limit,
+        )
+        if server_id:
+            rows = [r for r in rows if str(r.get("server_id")) == str(server_id)]
+        formatted_scoped = []
+        for r in rows:
+            rec = dict(r)
+            rec.setdefault("servers", None)
+            formatted_scoped.append(rec)
+        return formatted_scoped
     try:
         query = _supabase.table("optimization_recommendations").select("*, servers(server_name)")
         if server_id:
@@ -846,8 +907,23 @@ def list_optimization_recommendations(
         return []
 
 
-def update_optimization_recommendation_status(recommendation_id: str, status: str) -> dict:
-    """Update recommendation status ('active', 'applied', 'dismissed')."""
+def update_optimization_recommendation_status(
+    recommendation_id: str, status: str, org_id: Optional[str] = None
+) -> dict:
+    """Update recommendation status ('active', 'applied', 'dismissed').
+
+    When ``org_id`` is given, a recommendation owned by another
+    organization (by its organization column or its server) is treated
+    as missing ({}).
+    """
+    if org_id:
+        existing = get_optimization_recommendation(recommendation_id)
+        if not existing:
+            return {}
+        if str(existing.get("organization_id") or "") != str(org_id) and str(
+            existing.get("server_id")
+        ) not in _org_server_ids(org_id):
+            return {}
     try:
         now_iso = datetime.now(timezone.utc).isoformat()
         _supabase.table("optimization_recommendations").update(
@@ -1001,8 +1077,21 @@ def create_or_update_incident(payload: dict) -> dict:
         return data
 
 
-def list_incidents(status_filter: Optional[str] = None, limit: int = 50) -> list[dict]:
-    """List incidents with embedded server names."""
+def list_incidents(
+    status_filter: Optional[str] = None, limit: int = 50, org_id: Optional[str] = None
+) -> list[dict]:
+    """List incidents with embedded server names.
+
+    When ``org_id`` is given the list is tenant-scoped (see
+    ``list_incidents_scoped``).
+    """
+    if org_id:
+        return list_incidents_scoped(
+            organization_id=org_id,
+            server_ids=_org_server_ids(org_id),
+            status_filter=status_filter,
+            limit=limit,
+        )
     try:
         q = _supabase.table("incidents").select("*, servers(server_name)")
         if status_filter and status_filter != "all":
