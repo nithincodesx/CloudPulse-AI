@@ -343,3 +343,10 @@ CloudPulse-AI/
 
 Built with FastAPI, Next.js, Supabase and AWS — designed to tell you the
 truth about your infrastructure, including when the truth is "no data yet".
+
+---
+
+## 📄 License
+
+[MIT](LICENSE) © 2026 Nithinkrishna T D — free to use, copy, modify and
+distribute, with the copyright notice included.
